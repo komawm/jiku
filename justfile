@@ -39,3 +39,7 @@ hooks-install:
     lefthook install pre-commit
     carryctx hooks install --compose
 
+
+# Source-only development prerelease archive, manifest and checksums.
+package-source version out="dist":
+    bash scripts/package-source.sh --version "{{version}}" --out "{{out}}"

@@ -17,4 +17,8 @@ Provider names, routes, memory/voice settings, sandbox restrictions and CLI comm
 
 The incubation baseline is 0.0.1 on the 0.0.x line before a first formal 0.1.0 release line. The Rust scaffolding targets Rust 1.100.0 and Rust 2024; its local checks and pure-data contract unit tests pass under that target compiler, with no runtime daemon tests. A scaffold build does not establish an agent runtime. All Jiku crates use [GPL-3.0-or-later](https://github.com/komawm/jiku/blob/main/LICENSE). Preserve third-party attribution when implementation is added.
 
+## Releases
+
+`v0.0.x` tags are source-only development prereleases of the library scaffold, published to [GitHub Releases](https://github.com/komawm/jiku/releases) as `jiku-<version>-src.tar.gz` with `RELEASE-MANIFEST.toml` and `SHA256SUMS`; verify with `sha256sum -c SHA256SUMS`. They contain no runnable daemon or CLI. Build the same archive locally with `just package-source 0.0.1 /tmp/koma/jiku-dist`. Changes are recorded in [CHANGELOG.md](https://github.com/komawm/jiku/blob/main/CHANGELOG.md).
+
 Read [AGENTS.md](https://github.com/komawm/jiku/blob/main/AGENTS.md), use the repository justfile for its actual documentation/template gates, and track work in its local CarryCtx project. Local initialization does not publish or release the component.
