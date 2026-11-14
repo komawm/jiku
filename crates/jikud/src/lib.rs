@@ -519,6 +519,229 @@ impl LiveSessionConfig {
     }
 }
 
+/// Sub-grid probability-weighted centroid interpolated from Koma's 15x15
+/// `grid_225` (`A1..O15`) categorical distribution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Grid225Centroid {
+    /// Label of the highest-probability grid cell (e.g., `"L13"`).
+    pub top_cell: String,
+    /// Probability of `top_cell` alone.
+    pub top_single_prob: f32,
+    /// Sum of probabilities across `top_cell` and its qualifying 8-connected neighbors.
+    pub combined_cluster_mass: f32,
+    /// Probability-weighted horizontal pixel coordinate on `[0.0, width]`.
+    pub x: f32,
+    /// Probability-weighted vertical pixel coordinate on `[0.0, height]`.
+    pub y: f32,
+}
+
+fn parse_grid_225_label(label: &str) -> Option<(i32, i32)> {
+    let trimmed = label.trim();
+    let mut chars = trimmed.chars();
+    let col_char = chars.next()?;
+    if !('A'..='O').contains(&col_char) {
+        return None;
+    }
+    let row_str: &str = chars.as_str();
+    let row_1_based: i32 = row_str.parse().ok()?;
+    if !(1..=15).contains(&row_1_based) {
+        return None;
+    }
+    let col = i32::from(col_char as u8 - b'A');
+    let row = row_1_based - 1;
+    Some((col, row))
+}
+
+/// Interpolates a continuous pixel centroid `(x, y)` from a 15x15 `grid_225`
+/// (`A1..O15`) categorical probability distribution by clustering the mode cell
+/// with its 8-connected neighbors whose probabilities are at least `min_cell_prob`.
+///
+/// Time complexity: $O(N)$ where $N$ is `probabilities.len()`.
+/// Space complexity: $O(N)$ for parsed valid grid cells.
+#[must_use]
+pub fn interpolate_grid_225_centroid(
+    probabilities: &[(String, f32)],
+    width: f32,
+    height: f32,
+    min_cell_prob: f32,
+) -> Option<Grid225Centroid> {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    let parsed: Vec<(&str, i32, i32, f32)> = probabilities
+        .iter()
+        .filter_map(|(label, prob)| {
+            if !prob.is_finite() || *prob <= 0.0 {
+                return None;
+            }
+            let (col, row) = parse_grid_225_label(label)?;
+            Some((label.as_str(), col, row, *prob))
+        })
+        .collect();
+
+    let &(top_label, tc, tr, top_prob) = parsed.iter().max_by(|a, b| a.3.total_cmp(&b.3))?;
+
+    if top_prob < min_cell_prob {
+        return None;
+    }
+
+    let cell_w = width / 15.0;
+    let cell_h = height / 15.0;
+
+    let mut mass = 0.0_f32;
+    let mut weighted_x = 0.0_f32;
+    let mut weighted_y = 0.0_f32;
+
+    for &(_, col, row, prob) in &parsed {
+        if (col - tc).abs() <= 1 && (row - tr).abs() <= 1 && prob >= min_cell_prob {
+            let cx = (col as f32 + 0.5) * cell_w;
+            let cy = (row as f32 + 0.5) * cell_h;
+            mass += prob;
+            weighted_x += prob * cx;
+            weighted_y += prob * cy;
+        }
+    }
+
+    if mass <= 0.0 {
+        return None;
+    }
+
+    Some(Grid225Centroid {
+        top_cell: top_label.to_string(),
+        top_single_prob: top_prob,
+        combined_cluster_mass: mass,
+        x: weighted_x / mass,
+        y: weighted_y / mass,
+    })
+}
+
+/// Ordered time-slot `Choice` outcome for Strategy A (`TimeSlotMacro`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimeSlotSelection {
+    /// Winning choice token for this time slot (e.g., `"ctrl_c"` or `"stop_done"`).
+    pub choice: String,
+    /// Calibrated probability (`0.0..=1.0`) of the winning choice.
+    pub confidence: f32,
+}
+
+/// Strategy A (`TimeSlotMacro`): Compiles an ordered sequence of time-slot
+/// `Choice` answers (`slot_1..=slot_K`) into an executable macro sequence,
+/// truncating immediately at the first stop sentinel, fallback token, or
+/// low-confidence slot.
+///
+/// Time complexity: $O(K)$ where $K$ is `slots.len()`.
+/// Space complexity: $O(K)$ for the compiled macro vector.
+#[must_use]
+pub fn compile_time_slot_macro(
+    slots: &[TimeSlotSelection],
+    stop_sentinel: &str,
+    min_confidence: f32,
+) -> Vec<String> {
+    let mut compiled = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let token = slot.choice.trim();
+        if token.is_empty()
+            || token == stop_sentinel
+            || token == MANDATORY_CHOICE_FALLBACK
+            || token == "other"
+            || !slot.confidence.is_finite()
+            || slot.confidence < min_confidence
+        {
+            break;
+        }
+        compiled.push(token.to_string());
+    }
+    compiled
+}
+
+/// Candidate action evaluated with an independent `Noul` activation gate and
+/// per-step index probabilities for Strategy B (`BernoulliExpectedStep`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BernoulliStepCandidate {
+    /// Action or shortcut identifier (e.g., `"ctrl_c"`).
+    pub key: String,
+    /// Independent `Noul` `Yes` probability that this candidate belongs in the plan.
+    pub use_noul_prob: f32,
+    /// Pairs of `(step_index, probability)` for ordering active candidates.
+    pub step_probabilities: Vec<(u8, f32)>,
+}
+
+/// Strategy B (`BernoulliExpectedStep`): Filters candidates whose independent
+/// `use_noul_prob >= activation_threshold`, computes each active candidate's
+/// conditional expected step index $E[\text{step}] = \frac{\sum k \cdot P(\text{step}_k)}{\sum P(\text{step}_k)}$,
+/// and orders them by ascending $E[\text{step}]$.
+///
+/// Time complexity: $O(N \cdot S + M \log M)$ where $N$ is `candidates.len()`,
+/// $S$ is the average `step_probabilities` length, and $M \le N$ is the number
+/// of activated candidates.
+/// Space complexity: $O(M)$ for the filtered and sorted result vector.
+#[must_use]
+pub fn compile_bernoulli_step_macro(
+    candidates: &[BernoulliStepCandidate],
+    activation_threshold: f32,
+) -> Vec<(String, f32)> {
+    let mut active: Vec<(String, f32)> = candidates
+        .iter()
+        .filter(|c| {
+            !c.key.trim().is_empty()
+                && c.use_noul_prob.is_finite()
+                && c.use_noul_prob >= activation_threshold
+        })
+        .filter_map(|c| {
+            let mut weighted_sum = 0.0_f32;
+            let mut prob_sum = 0.0_f32;
+            for &(step, prob) in &c.step_probabilities {
+                if prob.is_finite() && prob > 0.0 {
+                    weighted_sum += f32::from(step) * prob;
+                    prob_sum += prob;
+                }
+            }
+            if prob_sum <= 0.0 {
+                None
+            } else {
+                Some((c.key.clone(), weighted_sum / prob_sum))
+            }
+        })
+        .collect();
+
+    active.sort_by(|a, b| a.1.total_cmp(&b.1));
+    active
+}
+
+/// Strategy C (`ThresholdProbe`): Filters an order-independent categorical or
+/// `Noul` probability distribution down to viable probe candidates (`prob >= min_prob`),
+/// excluding fallback sentinels, and orders them by descending probability.
+///
+/// Time complexity: $O(N \log N)$ where $N$ is `probabilities.len()`.
+/// Space complexity: $O(N)$ for the filtered and sorted probe list.
+#[must_use]
+pub fn compile_threshold_probe(
+    probabilities: &[(String, f32)],
+    min_prob: f32,
+) -> Vec<(String, f32)> {
+    let mut probes: Vec<(String, f32)> = probabilities
+        .iter()
+        .filter_map(|(candidate, prob)| {
+            let token = candidate.trim();
+            if token.is_empty()
+                || token == MANDATORY_CHOICE_FALLBACK
+                || token == "other"
+                || token == "not_visible"
+                || !prob.is_finite()
+                || *prob < min_prob
+            {
+                None
+            } else {
+                Some((token.to_string(), *prob))
+            }
+        })
+        .collect();
+
+    probes.sort_by(|a, b| b.1.total_cmp(&a.1));
+    probes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,5 +949,161 @@ mod tests {
         let mut missing_fence = valid;
         missing_fence.require_koma_epoch_fence = false;
         assert!(missing_fence.validate().is_err());
+    }
+
+    #[test]
+    fn decision_compiler_interpolates_grid_225_sub_cell_centroid() {
+        let dist = vec![
+            ("L13".to_string(), 0.54),
+            ("M13".to_string(), 0.41),
+            ("A1".to_string(), 0.03),
+            (MANDATORY_CHOICE_FALLBACK.to_string(), 0.02),
+        ];
+
+        let centroid = interpolate_grid_225_centroid(&dist, 750.0, 750.0, 0.05)
+            .expect("expected valid sub-grid centroid");
+
+        assert_eq!(centroid.top_cell, "L13");
+        assert!((centroid.top_single_prob - 0.54).abs() < 1e-5);
+        assert!((centroid.combined_cluster_mass - 0.95).abs() < 1e-5);
+        assert!((centroid.y - 625.0).abs() < 1e-4);
+        assert!(centroid.x > 575.0 && centroid.x < 625.0);
+    }
+
+    #[test]
+    fn decision_compiler_strategy_a_compiles_time_slot_macros_and_truncates() {
+        let five_step = vec![
+            TimeSlotSelection {
+                choice: "ctrl_a".to_string(),
+                confidence: 0.96,
+            },
+            TimeSlotSelection {
+                choice: "ctrl_c".to_string(),
+                confidence: 0.94,
+            },
+            TimeSlotSelection {
+                choice: "ctrl_t".to_string(),
+                confidence: 0.91,
+            },
+            TimeSlotSelection {
+                choice: "ctrl_v".to_string(),
+                confidence: 0.93,
+            },
+            TimeSlotSelection {
+                choice: "ctrl_s".to_string(),
+                confidence: 0.89,
+            },
+            TimeSlotSelection {
+                choice: "stop_done".to_string(),
+                confidence: 0.98,
+            },
+        ];
+        assert_eq!(
+            compile_time_slot_macro(&five_step, "stop_done", 0.80),
+            vec!["ctrl_a", "ctrl_c", "ctrl_t", "ctrl_v", "ctrl_s"]
+        );
+
+        let repeated_keys = vec![
+            TimeSlotSelection {
+                choice: "ctrl_shift_p".to_string(),
+                confidence: 0.95,
+            },
+            TimeSlotSelection {
+                choice: "down".to_string(),
+                confidence: 0.92,
+            },
+            TimeSlotSelection {
+                choice: "down".to_string(),
+                confidence: 0.90,
+            },
+            TimeSlotSelection {
+                choice: "enter".to_string(),
+                confidence: 0.94,
+            },
+            TimeSlotSelection {
+                choice: "stop_done".to_string(),
+                confidence: 0.97,
+            },
+            TimeSlotSelection {
+                choice: "enter".to_string(),
+                confidence: 0.99,
+            },
+        ];
+        assert_eq!(
+            compile_time_slot_macro(&repeated_keys, "stop_done", 0.80),
+            vec!["ctrl_shift_p", "down", "down", "enter"]
+        );
+
+        let low_confidence = vec![
+            TimeSlotSelection {
+                choice: "ctrl_a".to_string(),
+                confidence: 0.95,
+            },
+            TimeSlotSelection {
+                choice: "ctrl_c".to_string(),
+                confidence: 0.62,
+            },
+            TimeSlotSelection {
+                choice: "ctrl_v".to_string(),
+                confidence: 0.95,
+            },
+        ];
+        assert_eq!(
+            compile_time_slot_macro(&low_confidence, "stop_done", 0.80),
+            vec!["ctrl_a"]
+        );
+    }
+
+    #[test]
+    fn decision_compiler_strategy_b_orders_bernoulli_candidates_by_expected_step() {
+        let candidates = vec![
+            BernoulliStepCandidate {
+                key: "ctrl_v".to_string(),
+                use_noul_prob: 0.94,
+                step_probabilities: vec![(1, 0.01), (2, 0.04), (3, 0.90), (4, 0.05)],
+            },
+            BernoulliStepCandidate {
+                key: "ctrl_a".to_string(),
+                use_noul_prob: 0.98,
+                step_probabilities: vec![(1, 0.95), (2, 0.05)],
+            },
+            BernoulliStepCandidate {
+                key: "alt_f4".to_string(),
+                use_noul_prob: 0.02,
+                step_probabilities: vec![(1, 0.90)],
+            },
+            BernoulliStepCandidate {
+                key: "ctrl_c".to_string(),
+                use_noul_prob: 0.96,
+                step_probabilities: vec![(1, 0.05), (2, 0.90), (3, 0.05)],
+            },
+            BernoulliStepCandidate {
+                key: "ctrl_z".to_string(),
+                use_noul_prob: 0.12,
+                step_probabilities: vec![(1, 0.80)],
+            },
+        ];
+
+        let compiled = compile_bernoulli_step_macro(&candidates, 0.80);
+        let keys: Vec<&str> = compiled.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["ctrl_a", "ctrl_c", "ctrl_v"]);
+        assert!(compiled[0].1 < compiled[1].1 && compiled[1].1 < compiled[2].1);
+    }
+
+    #[test]
+    fn decision_compiler_strategy_c_ranks_threshold_probes_descending() {
+        let probs = vec![
+            ("space".to_string(), 0.09),
+            ("escape".to_string(), 0.62),
+            ("ctrl_w".to_string(), 0.03),
+            ("q".to_string(), 0.24),
+            (MANDATORY_CHOICE_FALLBACK.to_string(), 0.85),
+        ];
+
+        let probes = compile_threshold_probe(&probs, 0.15);
+        assert_eq!(
+            probes,
+            vec![("escape".to_string(), 0.62), ("q".to_string(), 0.24)]
+        );
     }
 }
