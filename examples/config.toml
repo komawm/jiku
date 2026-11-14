@@ -66,8 +66,53 @@ driver = "decisions"
 optional = true
 fallback_to_primary_text_model = true
 fast_path_confidence = 0.85
+max_questions_per_batch = 8
 require_none_or_other = true
 require_scope_gate = true
+
+# --- Decision Router & Compiler Policy (`DecisionRouterPolicy`) ---
+# All fields below have built-in `Default` implementations and can be customized.
+
+[decision_router]
+decision_provider = "gemini"
+decision_model_id = "gemini-decision-1"
+primary_provider = "gemini"
+primary_text_model_id = "gemini-2.5-pro"
+fast_path_confidence_threshold = 0.85
+max_questions_per_batch = 8
+
+[decision_router.compiler]
+fast_path_confidence = 0.85
+min_cell_prob = 0.05
+time_slot_min_confidence = 0.75
+bernoulli_activation_threshold = 0.80
+probe_min_prob = 0.15
+stop_sentinel = "stop_done"
+fallback_token = "NONE_OR_OTHER"
+
+# Spatial grid dimensions (`cols x rows`; must satisfy `2 <= cols * rows <= 255`
+# for `/v1beta/decisions` categorical `Choice` questions).
+[decision_router.compiler.grid]
+cols = 15
+rows = 15
+
+# --- Live Session Co-Pilot Configuration (`LiveSessionConfig`) ---
+# Defaults are 16 kHz uplink / 24 kHz downlink / 2 FPS screen capture;
+# sample rates (`8000..=48000` Hz) and screen FPS (`1..=60` FPS) are configurable.
+
+[live_session]
+model = "gemini-2.5-flash-live"
+response_modality = "Audio"
+output_audio_transcription = true
+proactive_audio = false
+enable_affective_dialog = true
+uplink_sample_rate_hz = 16000
+downlink_sample_rate_hz = 24000
+max_screen_fps = 2
+context_compression_trigger_tokens = 24000
+sliding_window_target_tokens = 12000
+session_resumption_enabled = true
+require_koma_epoch_fence = true
 
 [roles.live_companion]
 provider = "gemini"

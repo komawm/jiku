@@ -420,19 +420,29 @@ pub enum TurnDriverRole {
     FastGuard,
 }
 
-/// Required uplink PCM audio sample rate (`16 kHz`) for `LiveSessionDriver`.
+/// Default uplink PCM audio sample rate (`16 kHz`) for `LiveSessionDriver`.
 pub const UPLINK_AUDIO_SAMPLE_RATE_HZ: u32 = 16_000;
 
-/// Native downlink PCM audio sample rate (`24 kHz`) from `LiveSessionDriver`.
+/// Default native downlink PCM audio sample rate (`24 kHz`) from `LiveSessionDriver`.
 pub const DOWNLINK_AUDIO_SAMPLE_RATE_HZ: u32 = 24_000;
 
-/// Maximum Koma screen capture frame rate (`2 FPS`) streamed to a Live session.
-pub const MAX_SCREEN_FPS: u8 = 2;
+/// Minimum supported PCM audio sample rate (`8 kHz`) for `LiveSessionDriver`.
+pub const MIN_LIVE_AUDIO_SAMPLE_RATE_HZ: u32 = 8_000;
+
+/// Maximum supported PCM audio sample rate (`48 kHz`) for `LiveSessionDriver`.
+pub const MAX_LIVE_AUDIO_SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// Default Koma screen capture frame rate (`2 FPS`) streamed to a Live session.
+pub const DEFAULT_SCREEN_FPS: u8 = 2;
+
+/// Maximum configurable Koma screen capture frame rate (`60 FPS`) streamed to a Live session.
+pub const MAX_SCREEN_FPS: u8 = 60;
 
 /// Primary response modality for a `LiveSessionDriver` WebSocket session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum LiveResponseModality {
     /// Native audio output stream (`AUDIO`, 24 kHz PCM) with parallel transcription.
+    #[default]
     Audio,
     /// Text-only output stream (`TEXT`).
     Text,
@@ -467,10 +477,19 @@ pub struct ContextWindowCompressionSpec {
     pub sliding_window_target_tokens: u32,
 }
 
+impl Default for ContextWindowCompressionSpec {
+    fn default() -> Self {
+        Self {
+            trigger_tokens: 24_000,
+            sliding_window_target_tokens: 12_000,
+        }
+    }
+}
+
 /// Pure-data session configuration for `LiveSessionDriver` (`jiku live`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSessionConfig {
-    /// Live-capable model identifier (e.g., `"gemini-2.5-flash-live"`).
+    /// Live-capable model identifier (default `"gemini-2.5-flash-live"`).
     pub model: String,
     /// Single primary response modality (`Audio` or `Text`; never both).
     pub response_modality: LiveResponseModality,
@@ -478,7 +497,13 @@ pub struct LiveSessionConfig {
     pub output_audio_transcription: bool,
     /// Allow the model to remain silent when ambient speech is not addressed to Jiku.
     pub proactive_audio: bool,
-    /// Maximum screen frame rate (`1..=2` FPS).
+    /// Enable affective dialog prosody adaptation on supported Live models.
+    pub enable_affective_dialog: bool,
+    /// Uplink PCM audio sample rate in Hz (`8_000..=48_000`; default `16_000`).
+    pub uplink_sample_rate_hz: u32,
+    /// Downlink PCM audio sample rate in Hz (`8_000..=48_000`; default `24_000`).
+    pub downlink_sample_rate_hz: u32,
+    /// Maximum screen frame rate (`1..=60` FPS; default `2` FPS).
     pub max_screen_fps: u8,
     /// Context window compression thresholds.
     pub compression: ContextWindowCompressionSpec,
@@ -488,10 +513,29 @@ pub struct LiveSessionConfig {
     pub require_koma_epoch_fence: bool,
 }
 
+impl Default for LiveSessionConfig {
+    fn default() -> Self {
+        Self {
+            model: "gemini-2.5-flash-live".to_string(),
+            response_modality: LiveResponseModality::Audio,
+            output_audio_transcription: true,
+            proactive_audio: false,
+            enable_affective_dialog: true,
+            uplink_sample_rate_hz: UPLINK_AUDIO_SAMPLE_RATE_HZ,
+            downlink_sample_rate_hz: DOWNLINK_AUDIO_SAMPLE_RATE_HZ,
+            max_screen_fps: DEFAULT_SCREEN_FPS,
+            compression: ContextWindowCompressionSpec::default(),
+            session_resumption_enabled: true,
+            require_koma_epoch_fence: true,
+        }
+    }
+}
+
 impl LiveSessionConfig {
     /// Validates `LiveSessionDriver` session invariants:
     /// - `model` must not be empty.
-    /// - `max_screen_fps` must be in `1..=MAX_SCREEN_FPS` (`2` FPS).
+    /// - `uplink_sample_rate_hz` and `downlink_sample_rate_hz` must be in `8_000..=48_000` Hz.
+    /// - `max_screen_fps` must be in `1..=MAX_SCREEN_FPS` (`1..=60` FPS; default `2` FPS).
     /// - `compression.trigger_tokens` must be positive and strictly greater than
     ///   `compression.sliding_window_target_tokens` (which must also be positive).
     /// - `session_resumption_enabled` and `require_koma_epoch_fence` must be enabled.
@@ -499,8 +543,22 @@ impl LiveSessionConfig {
         if self.model.trim().is_empty() {
             return Err("LiveSessionConfig model must not be empty");
         }
+        if !(MIN_LIVE_AUDIO_SAMPLE_RATE_HZ..=MAX_LIVE_AUDIO_SAMPLE_RATE_HZ)
+            .contains(&self.uplink_sample_rate_hz)
+        {
+            return Err(
+                "LiveSessionConfig uplink_sample_rate_hz must be between 8000 and 48000 Hz",
+            );
+        }
+        if !(MIN_LIVE_AUDIO_SAMPLE_RATE_HZ..=MAX_LIVE_AUDIO_SAMPLE_RATE_HZ)
+            .contains(&self.downlink_sample_rate_hz)
+        {
+            return Err(
+                "LiveSessionConfig downlink_sample_rate_hz must be between 8000 and 48000 Hz",
+            );
+        }
         if self.max_screen_fps == 0 || self.max_screen_fps > MAX_SCREEN_FPS {
-            return Err("LiveSessionConfig max_screen_fps must be between 1 and 2 FPS");
+            return Err("LiveSessionConfig max_screen_fps must be between 1 and 60 FPS");
         }
         if self.compression.sliding_window_target_tokens == 0
             || self.compression.trigger_tokens <= self.compression.sliding_window_target_tokens
@@ -519,8 +577,140 @@ impl LiveSessionConfig {
     }
 }
 
-/// Sub-grid probability-weighted centroid interpolated from Koma's 15x15
-/// `grid_225` (`A1..O15`) categorical distribution.
+/// Configurable 2D spatial grid specification (`cols x rows`, default `15 x 15`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GridSpec {
+    /// Number of horizontal columns (`1..=26`, labelled `A..=Z`; default `15`).
+    pub cols: u8,
+    /// Number of vertical rows (`1..=255`, labelled `1..=rows`; default `15`).
+    pub rows: u8,
+}
+
+impl Default for GridSpec {
+    fn default() -> Self {
+        Self { cols: 15, rows: 15 }
+    }
+}
+
+impl GridSpec {
+    /// Returns the total number of cells (`cols * rows`) in the grid.
+    #[must_use]
+    pub const fn total_cells(&self) -> usize {
+        (self.cols as usize) * (self.rows as usize)
+    }
+
+    /// Returns `true` if `cols` fits within ASCII letters `A..=Z` (`1..=26`),
+    /// `rows >= 1`, and `total_cells()` satisfies the `/v1beta/decisions`
+    /// `Choice` cardinality bounds (`2..=255`).
+    #[must_use]
+    pub fn is_valid_for_decisions_api(&self) -> bool {
+        self.cols > 0
+            && self.cols <= 26
+            && self.rows > 0
+            && (MIN_CHOICE_OR_SCORE_CARDINALITY..=MAX_CHOICE_OR_SCORE_CARDINALITY)
+                .contains(&self.total_cells())
+    }
+
+    /// Parses a cell label (e.g., `"A1"`, `"L13"`) into 0-based `(col, row)` coordinates
+    /// bounded by `self.cols` and `self.rows`.
+    #[must_use]
+    pub fn parse_cell_label(&self, label: &str) -> Option<(i32, i32)> {
+        if self.cols == 0 || self.cols > 26 || self.rows == 0 {
+            return None;
+        }
+        let trimmed = label.trim();
+        let mut chars = trimmed.chars();
+        let col_char = chars.next()?;
+        let max_col_char = (b'A' + self.cols - 1) as char;
+        if !('A'..=max_col_char).contains(&col_char) {
+            return None;
+        }
+        let row_str: &str = chars.as_str();
+        let row_1_based: i32 = row_str.parse().ok()?;
+        if !(1..=i32::from(self.rows)).contains(&row_1_based) {
+            return None;
+        }
+        let col = i32::from(col_char as u8 - b'A');
+        let row = row_1_based - 1;
+        Some((col, row))
+    }
+
+    /// Interpolates a continuous pixel centroid `(x, y)` on `[0.0, width] x [0.0, height]`
+    /// from a categorical probability distribution over this `cols x rows` grid by
+    /// clustering the mode cell with its 8-connected neighbors whose probabilities are
+    /// at least `min_cell_prob`.
+    ///
+    /// Time complexity: $O(N)$ where $N$ is `probabilities.len()`.
+    /// Space complexity: $O(N)$ for parsed valid grid cells.
+    #[must_use]
+    pub fn interpolate_centroid(
+        &self,
+        probabilities: &[(String, f32)],
+        width: f32,
+        height: f32,
+        min_cell_prob: f32,
+    ) -> Option<Grid225Centroid> {
+        if self.cols == 0
+            || self.cols > 26
+            || self.rows == 0
+            || !width.is_finite()
+            || !height.is_finite()
+            || width <= 0.0
+            || height <= 0.0
+        {
+            return None;
+        }
+
+        let parsed: Vec<(&str, i32, i32, f32)> = probabilities
+            .iter()
+            .filter_map(|(label, prob)| {
+                if !prob.is_finite() || *prob <= 0.0 {
+                    return None;
+                }
+                let (col, row) = self.parse_cell_label(label)?;
+                Some((label.as_str(), col, row, *prob))
+            })
+            .collect();
+
+        let &(top_label, tc, tr, top_prob) = parsed.iter().max_by(|a, b| a.3.total_cmp(&b.3))?;
+
+        if top_prob < min_cell_prob {
+            return None;
+        }
+
+        let cell_w = width / f32::from(self.cols);
+        let cell_h = height / f32::from(self.rows);
+
+        let mut mass = 0.0_f32;
+        let mut weighted_x = 0.0_f32;
+        let mut weighted_y = 0.0_f32;
+
+        for &(_, col, row, prob) in &parsed {
+            if (col - tc).abs() <= 1 && (row - tr).abs() <= 1 && prob >= min_cell_prob {
+                let cx = (col as f32 + 0.5) * cell_w;
+                let cy = (row as f32 + 0.5) * cell_h;
+                mass += prob;
+                weighted_x += prob * cx;
+                weighted_y += prob * cy;
+            }
+        }
+
+        if mass <= 0.0 {
+            return None;
+        }
+
+        Some(Grid225Centroid {
+            top_cell: top_label.to_string(),
+            top_single_prob: top_prob,
+            combined_cluster_mass: mass,
+            x: weighted_x / mass,
+            y: weighted_y / mass,
+        })
+    }
+}
+
+/// Sub-grid probability-weighted centroid interpolated from Koma's spatial grid
+/// (default 15x15 `grid_225`, `A1..O15`) categorical distribution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Grid225Centroid {
     /// Label of the highest-probability grid cell (e.g., `"L13"`).
@@ -533,23 +723,6 @@ pub struct Grid225Centroid {
     pub x: f32,
     /// Probability-weighted vertical pixel coordinate on `[0.0, height]`.
     pub y: f32,
-}
-
-fn parse_grid_225_label(label: &str) -> Option<(i32, i32)> {
-    let trimmed = label.trim();
-    let mut chars = trimmed.chars();
-    let col_char = chars.next()?;
-    if !('A'..='O').contains(&col_char) {
-        return None;
-    }
-    let row_str: &str = chars.as_str();
-    let row_1_based: i32 = row_str.parse().ok()?;
-    if !(1..=15).contains(&row_1_based) {
-        return None;
-    }
-    let col = i32::from(col_char as u8 - b'A');
-    let row = row_1_based - 1;
-    Some((col, row))
 }
 
 /// Interpolates a continuous pixel centroid `(x, y)` from a 15x15 `grid_225`
@@ -565,55 +738,7 @@ pub fn interpolate_grid_225_centroid(
     height: f32,
     min_cell_prob: f32,
 ) -> Option<Grid225Centroid> {
-    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
-        return None;
-    }
-
-    let parsed: Vec<(&str, i32, i32, f32)> = probabilities
-        .iter()
-        .filter_map(|(label, prob)| {
-            if !prob.is_finite() || *prob <= 0.0 {
-                return None;
-            }
-            let (col, row) = parse_grid_225_label(label)?;
-            Some((label.as_str(), col, row, *prob))
-        })
-        .collect();
-
-    let &(top_label, tc, tr, top_prob) = parsed.iter().max_by(|a, b| a.3.total_cmp(&b.3))?;
-
-    if top_prob < min_cell_prob {
-        return None;
-    }
-
-    let cell_w = width / 15.0;
-    let cell_h = height / 15.0;
-
-    let mut mass = 0.0_f32;
-    let mut weighted_x = 0.0_f32;
-    let mut weighted_y = 0.0_f32;
-
-    for &(_, col, row, prob) in &parsed {
-        if (col - tc).abs() <= 1 && (row - tr).abs() <= 1 && prob >= min_cell_prob {
-            let cx = (col as f32 + 0.5) * cell_w;
-            let cy = (row as f32 + 0.5) * cell_h;
-            mass += prob;
-            weighted_x += prob * cx;
-            weighted_y += prob * cy;
-        }
-    }
-
-    if mass <= 0.0 {
-        return None;
-    }
-
-    Some(Grid225Centroid {
-        top_cell: top_label.to_string(),
-        top_single_prob: top_prob,
-        combined_cluster_mass: mass,
-        x: weighted_x / mass,
-        y: weighted_y / mass,
-    })
+    GridSpec::default().interpolate_centroid(probabilities, width, height, min_cell_prob)
 }
 
 /// Ordered time-slot `Choice` outcome for Strategy A (`TimeSlotMacro`).
@@ -638,11 +763,26 @@ pub fn compile_time_slot_macro(
     stop_sentinel: &str,
     min_confidence: f32,
 ) -> Vec<String> {
+    compile_time_slot_macro_with_fallback(
+        slots,
+        stop_sentinel,
+        MANDATORY_CHOICE_FALLBACK,
+        min_confidence,
+    )
+}
+
+fn compile_time_slot_macro_with_fallback(
+    slots: &[TimeSlotSelection],
+    stop_sentinel: &str,
+    fallback_token: &str,
+    min_confidence: f32,
+) -> Vec<String> {
     let mut compiled = Vec::with_capacity(slots.len());
     for slot in slots {
         let token = slot.choice.trim();
         if token.is_empty()
             || token == stop_sentinel
+            || token == fallback_token
             || token == MANDATORY_CHOICE_FALLBACK
             || token == "other"
             || !slot.confidence.is_finite()
@@ -720,11 +860,20 @@ pub fn compile_threshold_probe(
     probabilities: &[(String, f32)],
     min_prob: f32,
 ) -> Vec<(String, f32)> {
+    compile_threshold_probe_with_fallback(probabilities, MANDATORY_CHOICE_FALLBACK, min_prob)
+}
+
+fn compile_threshold_probe_with_fallback(
+    probabilities: &[(String, f32)],
+    fallback_token: &str,
+    min_prob: f32,
+) -> Vec<(String, f32)> {
     let mut probes: Vec<(String, f32)> = probabilities
         .iter()
         .filter_map(|(candidate, prob)| {
             let token = candidate.trim();
             if token.is_empty()
+                || token == fallback_token
                 || token == MANDATORY_CHOICE_FALLBACK
                 || token == "other"
                 || token == "not_visible"
@@ -740,6 +889,118 @@ pub fn compile_threshold_probe(
 
     probes.sort_by(|a, b| b.1.total_cmp(&a.1));
     probes
+}
+
+/// Configurable thresholds, grid geometry, and sentinel tokens for `DecisionCompiler`
+/// post-processing strategies (spatial centroid interpolation, Strategy A time-slot macros,
+/// Strategy B Bernoulli expected-step ordering, and Strategy C threshold probes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionCompilerConfig {
+    /// Spatial grid geometry (`cols x rows`, default `15 x 15`).
+    pub grid: GridSpec,
+    /// Confidence threshold required before executing a fast-path Koma action (default `0.85`).
+    pub fast_path_confidence: f32,
+    /// Minimum cell probability included in 8-connected centroid interpolation (default `0.05`).
+    pub min_cell_prob: f32,
+    /// Minimum slot confidence for Strategy A (`TimeSlotMacro`, default `0.75`).
+    pub time_slot_min_confidence: f32,
+    /// Minimum `Noul` activation probability for Strategy B (`BernoulliExpectedStep`, default `0.80`).
+    pub bernoulli_activation_threshold: f32,
+    /// Minimum candidate probability for Strategy C (`ThresholdProbe`, default `0.15`).
+    pub probe_min_prob: f32,
+    /// Sentinel choice token that terminates a Strategy A time-slot macro (default `"stop_done"`).
+    pub stop_sentinel: String,
+    /// Mandatory out-of-set fallback choice token (default `"NONE_OR_OTHER"`).
+    pub fallback_token: String,
+}
+
+impl Default for DecisionCompilerConfig {
+    fn default() -> Self {
+        Self {
+            grid: GridSpec::default(),
+            fast_path_confidence: DEFAULT_FAST_PATH_CONFIDENCE,
+            min_cell_prob: 0.05,
+            time_slot_min_confidence: 0.75,
+            bernoulli_activation_threshold: 0.80,
+            probe_min_prob: 0.15,
+            stop_sentinel: "stop_done".to_string(),
+            fallback_token: MANDATORY_CHOICE_FALLBACK.to_string(),
+        }
+    }
+}
+
+impl DecisionCompilerConfig {
+    /// Interpolates a continuous pixel centroid `(x, y)` on `[0.0, width] x [0.0, height]`
+    /// using `self.grid` and `self.min_cell_prob`.
+    #[must_use]
+    pub fn interpolate_grid(
+        &self,
+        probabilities: &[(String, f32)],
+        width: f32,
+        height: f32,
+    ) -> Option<Grid225Centroid> {
+        self.grid
+            .interpolate_centroid(probabilities, width, height, self.min_cell_prob)
+    }
+
+    /// Compiles an ordered sequence of Strategy A time-slot `Choice` answers using
+    /// `self.stop_sentinel`, `self.fallback_token`, and `self.time_slot_min_confidence`.
+    #[must_use]
+    pub fn compile_time_slot(&self, slots: &[TimeSlotSelection]) -> Vec<String> {
+        compile_time_slot_macro_with_fallback(
+            slots,
+            &self.stop_sentinel,
+            &self.fallback_token,
+            self.time_slot_min_confidence,
+        )
+    }
+
+    /// Compiles Strategy B Bernoulli step candidates using `self.bernoulli_activation_threshold`.
+    #[must_use]
+    pub fn compile_bernoulli_steps(
+        &self,
+        candidates: &[BernoulliStepCandidate],
+    ) -> Vec<(String, f32)> {
+        compile_bernoulli_step_macro(candidates, self.bernoulli_activation_threshold)
+    }
+
+    /// Compiles Strategy C threshold probes using `self.fallback_token` and `self.probe_min_prob`.
+    #[must_use]
+    pub fn compile_probe(&self, probabilities: &[(String, f32)]) -> Vec<(String, f32)> {
+        compile_threshold_probe_with_fallback(
+            probabilities,
+            &self.fallback_token,
+            self.probe_min_prob,
+        )
+    }
+
+    /// Routes a `DecisionsDriver` evaluation using `self.fast_path_confidence` and `self.fallback_token`.
+    #[must_use]
+    pub fn route(
+        &self,
+        in_scope_yes_prob: f32,
+        top_choice: &str,
+        top_choice_prob: f32,
+        safety_blocked: bool,
+    ) -> ControlPlaneRoute {
+        if top_choice == self.fallback_token {
+            if safety_blocked {
+                return ControlPlaneRoute::RequireHumanVerification {
+                    reason: "safety_gate_triggered",
+                };
+            }
+            return ControlPlaneRoute::FallbackTurnPlanner {
+                confidence: in_scope_yes_prob * top_choice_prob,
+            };
+        }
+        route_decision(
+            in_scope_yes_prob,
+            top_choice,
+            top_choice_prob,
+            safety_blocked,
+            self.fast_path_confidence,
+        )
+    }
 }
 
 /// Execution mode for structured decision batches in `jikud`.
@@ -765,6 +1026,65 @@ pub enum DecisionExecutionMode {
         /// Whether strict JSON Schema output enforcement is enabled.
         enforce_json_schema: bool,
     },
+}
+
+impl Default for DecisionExecutionMode {
+    fn default() -> Self {
+        Self::NativeDecisionsApi {
+            provider: "gemini".to_string(),
+            model: GEMINI_DECISION_1_MODEL_ID.to_string(),
+        }
+    }
+}
+
+/// Configurable routing and post-processing policy for `DecisionsDriver` (`[roles.decision_router]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionRouterPolicy {
+    /// Default or resolved execution mode (`NativeDecisionsApi` vs `EmulatedStructuredTextModel`).
+    pub mode: DecisionExecutionMode,
+    /// Optional dedicated decision provider key (default `Some("gemini")`).
+    pub decision_provider: Option<String>,
+    /// Optional dedicated decision model ID (default `Some("gemini-decision-1")`;
+    /// setting `None` falls back to `primary_text_model_id`).
+    pub decision_model_id: Option<String>,
+    /// Primary text/planner provider key used when `decision_model_id` is omitted (default `"gemini"`).
+    pub primary_provider: String,
+    /// Primary text/planner model ID used when `decision_model_id` is omitted (default `"gemini-2.5-pro"`).
+    pub primary_text_model_id: String,
+    /// Confidence threshold required before executing a fast-path Koma action (default `0.85`).
+    pub fast_path_confidence_threshold: f32,
+    /// Maximum concurrent questions per decision batch (default `8`).
+    pub max_questions_per_batch: usize,
+    /// Configurable compiler parameters (grid dimensions, thresholds, and sentinels).
+    pub compiler: DecisionCompilerConfig,
+}
+
+impl Default for DecisionRouterPolicy {
+    fn default() -> Self {
+        Self {
+            mode: DecisionExecutionMode::default(),
+            decision_provider: Some("gemini".to_string()),
+            decision_model_id: Some(GEMINI_DECISION_1_MODEL_ID.to_string()),
+            primary_provider: "gemini".to_string(),
+            primary_text_model_id: "gemini-2.5-pro".to_string(),
+            fast_path_confidence_threshold: DEFAULT_FAST_PATH_CONFIDENCE,
+            max_questions_per_batch: 8,
+            compiler: DecisionCompilerConfig::default(),
+        }
+    }
+}
+
+impl DecisionRouterPolicy {
+    /// Resolves the effective [`DecisionExecutionMode`] from this policy's configured
+    /// `decision_model_id` and `primary_text_model_id`.
+    pub fn resolve_mode(&self) -> Result<DecisionExecutionMode, &'static str> {
+        resolve_decision_execution_mode(
+            &self.primary_provider,
+            &self.primary_text_model_id,
+            self.decision_provider.as_deref(),
+            self.decision_model_id.as_deref(),
+        )
+    }
 }
 
 /// Resolves whether a decision batch should execute against the native `/v1beta/decisions`
@@ -1056,28 +1376,159 @@ mod tests {
 
     #[test]
     fn live_session_config_validates_fps_compression_and_epoch_fences() {
-        let valid = LiveSessionConfig {
-            model: "gemini-2.5-flash-live".to_string(),
-            response_modality: LiveResponseModality::Audio,
-            output_audio_transcription: true,
-            proactive_audio: true,
-            max_screen_fps: MAX_SCREEN_FPS,
-            compression: ContextWindowCompressionSpec {
-                trigger_tokens: 10_000,
-                sliding_window_target_tokens: 2_000,
-            },
-            session_resumption_enabled: true,
-            require_koma_epoch_fence: true,
-        };
+        let valid = LiveSessionConfig::default();
+        assert_eq!(valid.model, "gemini-2.5-flash-live");
+        assert_eq!(valid.uplink_sample_rate_hz, 16_000);
+        assert_eq!(valid.downlink_sample_rate_hz, 24_000);
+        assert_eq!(valid.max_screen_fps, 2);
+        assert!(valid.enable_affective_dialog);
+        assert!(!valid.proactive_audio);
+        assert_eq!(valid.compression.trigger_tokens, 24_000);
         assert_eq!(valid.validate(), Ok(()));
 
-        let mut invalid_fps = valid.clone();
-        invalid_fps.max_screen_fps = 5;
-        assert!(invalid_fps.validate().is_err());
+        let mut custom_valid = valid.clone();
+        custom_valid.uplink_sample_rate_hz = 24_000;
+        custom_valid.downlink_sample_rate_hz = 48_000;
+        custom_valid.max_screen_fps = 5;
+        custom_valid.proactive_audio = true;
+        assert_eq!(custom_valid.validate(), Ok(()));
+
+        let mut invalid_zero_fps = valid.clone();
+        invalid_zero_fps.max_screen_fps = 0;
+        assert!(invalid_zero_fps.validate().is_err());
+
+        let mut invalid_high_fps = valid.clone();
+        invalid_high_fps.max_screen_fps = 120;
+        assert!(invalid_high_fps.validate().is_err());
+
+        let mut invalid_uplink_hz = valid.clone();
+        invalid_uplink_hz.uplink_sample_rate_hz = 0;
+        assert!(invalid_uplink_hz.validate().is_err());
+
+        let mut invalid_downlink_hz = valid.clone();
+        invalid_downlink_hz.downlink_sample_rate_hz = 96_000;
+        assert!(invalid_downlink_hz.validate().is_err());
 
         let mut missing_fence = valid;
         missing_fence.require_koma_epoch_fence = false;
         assert!(missing_fence.validate().is_err());
+    }
+
+    #[test]
+    fn custom_grid_spec_and_decision_compiler_config_work_with_defaults_and_overrides() {
+        let default_grid = GridSpec::default();
+        assert_eq!(default_grid.cols, 15);
+        assert_eq!(default_grid.rows, 15);
+        assert_eq!(default_grid.total_cells(), 225);
+        assert!(default_grid.is_valid_for_decisions_api());
+
+        let grid_10x10 = GridSpec { cols: 10, rows: 10 };
+        assert_eq!(grid_10x10.total_cells(), 100);
+        assert!(grid_10x10.is_valid_for_decisions_api());
+        assert_eq!(grid_10x10.parse_cell_label("J10"), Some((9, 9)));
+        assert_eq!(grid_10x10.parse_cell_label("K10"), None);
+        assert_eq!(grid_10x10.parse_cell_label("A11"), None);
+
+        let oversized_grid = GridSpec { cols: 20, rows: 20 };
+        assert!(!oversized_grid.is_valid_for_decisions_api());
+
+        let mut compiler = DecisionCompilerConfig {
+            grid: grid_10x10,
+            stop_sentinel: "halt_now".to_string(),
+            fallback_token: "CUSTOM_FALLBACK".to_string(),
+            time_slot_min_confidence: 0.70,
+            ..DecisionCompilerConfig::default()
+        };
+        assert!((compiler.fast_path_confidence - 0.85).abs() < 1e-6);
+        assert!((compiler.min_cell_prob - 0.05).abs() < 1e-6);
+        assert!((compiler.bernoulli_activation_threshold - 0.80).abs() < 1e-6);
+        assert!((compiler.probe_min_prob - 0.15).abs() < 1e-6);
+
+        let dist_10x10 = vec![
+            ("E5".to_string(), 0.60),
+            ("F5".to_string(), 0.30),
+            ("CUSTOM_FALLBACK".to_string(), 0.10),
+        ];
+        let centroid = compiler
+            .interpolate_grid(&dist_10x10, 1000.0, 1000.0)
+            .expect("expected valid 10x10 centroid");
+        assert_eq!(centroid.top_cell, "E5");
+        assert!((centroid.combined_cluster_mass - 0.90).abs() < 1e-5);
+        assert!((centroid.y - 450.0).abs() < 1e-4);
+        assert!(centroid.x > 450.0 && centroid.x < 550.0);
+
+        let slots = vec![
+            TimeSlotSelection {
+                choice: "ctrl_a".to_string(),
+                confidence: 0.72,
+            },
+            TimeSlotSelection {
+                choice: "halt_now".to_string(),
+                confidence: 0.99,
+            },
+            TimeSlotSelection {
+                choice: "ctrl_v".to_string(),
+                confidence: 0.95,
+            },
+        ];
+        assert_eq!(compiler.compile_time_slot(&slots), vec!["ctrl_a"]);
+
+        let probes = compiler.compile_probe(&dist_10x10);
+        assert_eq!(
+            probes,
+            vec![("E5".to_string(), 0.60), ("F5".to_string(), 0.30)]
+        );
+
+        assert!(matches!(
+            compiler.route(0.95, "CUSTOM_FALLBACK", 0.95, false),
+            ControlPlaneRoute::FallbackTurnPlanner { .. }
+        ));
+
+        compiler.bernoulli_activation_threshold = 0.90;
+        let bernoulli = vec![
+            BernoulliStepCandidate {
+                key: "step_b".to_string(),
+                use_noul_prob: 0.95,
+                step_probabilities: vec![(2, 1.0)],
+            },
+            BernoulliStepCandidate {
+                key: "step_a".to_string(),
+                use_noul_prob: 0.85,
+                step_probabilities: vec![(1, 1.0)],
+            },
+        ];
+        let active = compiler.compile_bernoulli_steps(&bernoulli);
+        assert_eq!(active, vec![("step_b".to_string(), 2.0)]);
+
+        let default_policy = DecisionRouterPolicy::default();
+        assert_eq!(
+            default_policy.decision_model_id.as_deref(),
+            Some("gemini-decision-1")
+        );
+        assert_eq!(default_policy.primary_text_model_id, "gemini-2.5-pro");
+        assert_eq!(default_policy.max_questions_per_batch, 8);
+        assert_eq!(
+            default_policy.resolve_mode(),
+            Ok(DecisionExecutionMode::NativeDecisionsApi {
+                provider: "gemini".to_string(),
+                model: "gemini-decision-1".to_string(),
+            })
+        );
+
+        let fallback_policy = DecisionRouterPolicy {
+            decision_model_id: None,
+            primary_provider: "openai".to_string(),
+            primary_text_model_id: "gpt-4o".to_string(),
+            ..DecisionRouterPolicy::default()
+        };
+        assert_eq!(
+            fallback_policy.resolve_mode(),
+            Ok(DecisionExecutionMode::EmulatedStructuredTextModel {
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+                enforce_json_schema: true,
+            })
+        );
     }
 
     #[test]
