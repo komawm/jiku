@@ -742,6 +742,135 @@ pub fn compile_threshold_probe(
     probes
 }
 
+/// Execution mode for structured decision batches in `jikud`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionExecutionMode {
+    /// Uses the native zero-decode `/v1beta/decisions` endpoint (`model == "gemini-decision-1"`, `0` output tokens).
+    NativeDecisionsApi {
+        /// Provider key (e.g., `"gemini"`).
+        provider: String,
+        /// Pinned decision model ID (`"gemini-decision-1"`).
+        model: String,
+    },
+    /// Uses any configured text/multimodal model (e.g., OpenAI GPT, Anthropic Claude,
+    /// Gemini Pro/Flash, OpenRouter, or local `vLLM`/`llama.cpp`/`Ollama`) to emulate
+    /// the exact [`DecisionBatchSpec`] output contract via prompt-constrained JSON Schema
+    /// output when no dedicated decision model is configured (or when the user assigns
+    /// a general text model to the decision role).
+    EmulatedStructuredTextModel {
+        /// Provider key serving the text/multimodal model.
+        provider: String,
+        /// Target text/multimodal model identifier.
+        model: String,
+        /// Whether strict JSON Schema output enforcement is enabled.
+        enforce_json_schema: bool,
+    },
+}
+
+/// Resolves whether a decision batch should execute against the native `/v1beta/decisions`
+/// endpoint or fall back to structured-output emulation on the configured/primary text model.
+///
+/// If `configured_decision_model` is `None` or empty, this function **never errors** and
+/// automatically falls back to [`DecisionExecutionMode::EmulatedStructuredTextModel`] using
+/// `primary_provider` and `primary_model`.
+///
+/// Time complexity: $O(1)$ string slice inspection and allocation.
+/// Space complexity: $O(P + M)$ for the cloned provider and model strings.
+pub fn resolve_decision_execution_mode(
+    primary_provider: &str,
+    primary_model: &str,
+    configured_decision_provider: Option<&str>,
+    configured_decision_model: Option<&str>,
+) -> Result<DecisionExecutionMode, &'static str> {
+    let primary_prov = primary_provider.trim();
+    let primary_mod = primary_model.trim();
+    if primary_prov.is_empty() || primary_mod.is_empty() {
+        return Err("primary_provider and primary_model must not be empty");
+    }
+
+    let resolved_provider = configured_decision_provider
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or(primary_prov);
+
+    match configured_decision_model.map(str::trim) {
+        Some(m) if !m.is_empty() => {
+            if m == "gemini-decision-1-latest" || m == "gemini-decision-latest" {
+                return Err("unpinned -latest alias is not supported on /v1beta/decisions");
+            }
+            if m == GEMINI_DECISION_1_MODEL_ID {
+                Ok(DecisionExecutionMode::NativeDecisionsApi {
+                    provider: resolved_provider.to_string(),
+                    model: GEMINI_DECISION_1_MODEL_ID.to_string(),
+                })
+            } else {
+                Ok(DecisionExecutionMode::EmulatedStructuredTextModel {
+                    provider: resolved_provider.to_string(),
+                    model: m.to_string(),
+                    enforce_json_schema: true,
+                })
+            }
+        }
+        _ => Ok(DecisionExecutionMode::EmulatedStructuredTextModel {
+            provider: primary_prov.to_string(),
+            model: primary_mod.to_string(),
+            enforce_json_schema: true,
+        }),
+    }
+}
+
+/// Deterministically generates a structured-output constraint prompt instructing a
+/// general text/VLM model (GPT / Claude / local LLM) to output ONLY a valid JSON
+/// object `{"answers": { ... }}` matching the exact `noul`, `choice`, and `score`
+/// schema for every question in `questions`.
+///
+/// Time complexity: $O(Q \cdot C)$ where $Q$ is `questions.len()` and $C$ is the
+/// average number of choices/rubric items per question.
+/// Space complexity: $O(Q \cdot C)$ for the synthesized prompt string.
+#[must_use]
+pub fn synthesize_emulated_decision_prompt(questions: &[(String, DecisionQuestionKind)]) -> String {
+    let mut out = String::from(
+        "Output ONLY a valid JSON object matching {\"answers\": { ... }} with no markdown fences or extra prose.\n\
+         Schema rules per question type:\n\
+         - noul: {\"type\":\"noul\",\"noul\":0.01..0.99,\"confidence\":0.50..0.99}\n\
+         - choice: {\"type\":\"choice\",\"choice\":\"<winner>\",\"probabilities\":{...},\"confidence\":0.0..1.0} (probabilities must sum to 1.0)\n\
+         - score: {\"type\":\"score\",\"score\":1..N,\"probabilities\":{\"1\":...,\"N\":...},\"confidence\":0.0..1.0} (probabilities must sum to 1.0)\n\
+         Questions:\n",
+    );
+
+    for (qid, kind) in questions {
+        match kind {
+            DecisionQuestionKind::Noul { instructions } => {
+                out.push_str(&format!(
+                    "- id=\"{qid}\" type=\"noul\" instructions=\"{instructions}\"\n"
+                ));
+            }
+            DecisionQuestionKind::Choice {
+                instructions,
+                choices,
+                scope_gate_question_id,
+            } => {
+                let joined_choices = choices.join(", ");
+                out.push_str(&format!(
+                    "- id=\"{qid}\" type=\"choice\" scope_gate=\"{scope_gate_question_id}\" choices=[{joined_choices}] instructions=\"{instructions}\"\n"
+                ));
+            }
+            DecisionQuestionKind::Score {
+                instructions,
+                rubric,
+            } => {
+                let joined_rubric = rubric.join(" | ");
+                out.push_str(&format!(
+                    "- id=\"{qid}\" type=\"score\" levels=1..={} rubric=[{joined_rubric}] instructions=\"{instructions}\"\n",
+                    rubric.len()
+                ));
+            }
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,5 +1234,119 @@ mod tests {
             probes,
             vec![("escape".to_string(), 0.62), ("q".to_string(), 0.24)]
         );
+    }
+
+    #[test]
+    fn resolve_decision_mode_selects_native_api_for_gemini_decision_1() {
+        let mode = resolve_decision_execution_mode(
+            "openai",
+            "gpt-4o",
+            Some("gemini"),
+            Some("gemini-decision-1"),
+        )
+        .expect("expected native decision mode");
+        assert_eq!(
+            mode,
+            DecisionExecutionMode::NativeDecisionsApi {
+                provider: "gemini".to_string(),
+                model: GEMINI_DECISION_1_MODEL_ID.to_string(),
+            }
+        );
+        assert!(
+            resolve_decision_execution_mode(
+                "gemini",
+                "gemini-2.5-pro",
+                Some("gemini"),
+                Some("gemini-decision-1-latest"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_decision_mode_falls_back_to_primary_text_model_when_unconfigured() {
+        let mode_none = resolve_decision_execution_mode("openai", "gpt-4o", None, None)
+            .expect("fallback on None must never error");
+        assert_eq!(
+            mode_none,
+            DecisionExecutionMode::EmulatedStructuredTextModel {
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+                enforce_json_schema: true,
+            }
+        );
+
+        let mode_empty =
+            resolve_decision_execution_mode("anthropic", "claude-3-7-sonnet", Some(""), Some("  "))
+                .expect("fallback on empty string must never error");
+        assert_eq!(
+            mode_empty,
+            DecisionExecutionMode::EmulatedStructuredTextModel {
+                provider: "anthropic".to_string(),
+                model: "claude-3-7-sonnet".to_string(),
+                enforce_json_schema: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_decision_mode_uses_emulated_structured_model_for_custom_text_or_local_vlm() {
+        let mode = resolve_decision_execution_mode(
+            "openai",
+            "gpt-4o",
+            Some("local_vlm"),
+            Some("qwen2.5-vl-7b"),
+        )
+        .expect("custom local VLM decision role must succeed");
+        assert_eq!(
+            mode,
+            DecisionExecutionMode::EmulatedStructuredTextModel {
+                provider: "local_vlm".to_string(),
+                model: "qwen2.5-vl-7b".to_string(),
+                enforce_json_schema: true,
+            }
+        );
+    }
+
+    #[test]
+    fn synthesize_emulated_decision_prompt_includes_all_questions_and_schema_constraints() {
+        let questions = vec![
+            (
+                "q_in_scope".to_string(),
+                DecisionQuestionKind::Noul {
+                    instructions: "Is the terminal visible?".to_string(),
+                },
+            ),
+            (
+                "q_action".to_string(),
+                DecisionQuestionKind::Choice {
+                    instructions: "Select the best shortcut".to_string(),
+                    choices: vec![
+                        "ctrl_c".to_string(),
+                        "ctrl_v".to_string(),
+                        MANDATORY_CHOICE_FALLBACK.to_string(),
+                    ],
+                    scope_gate_question_id: "q_in_scope".to_string(),
+                },
+            ),
+            (
+                "q_quality".to_string(),
+                DecisionQuestionKind::Score {
+                    instructions: "Rate layout clarity".to_string(),
+                    rubric: vec!["Poor".to_string(), "Good".to_string()],
+                },
+            ),
+        ];
+
+        let prompt = synthesize_emulated_decision_prompt(&questions);
+        assert!(prompt.contains("{\"answers\": { ... }}"));
+        assert!(prompt.contains("q_in_scope"));
+        assert!(prompt.contains("type=\"noul\""));
+        assert!(prompt.contains("q_action"));
+        assert!(prompt.contains("type=\"choice\""));
+        assert!(prompt.contains("ctrl_c, ctrl_v, NONE_OR_OTHER"));
+        assert!(prompt.contains("q_quality"));
+        assert!(prompt.contains("type=\"score\""));
+        assert!(prompt.contains("Poor | Good"));
     }
 }

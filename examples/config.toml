@@ -20,6 +20,16 @@ kind = "google_gemini"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 api_key_env = "GEMINI_API_KEY"
 
+[providers.openai]
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+
 [providers.openrouter]
 kind = "openai_compatible"
 base_url = "https://openrouter.ai/api/v1"
@@ -45,10 +55,16 @@ driver = "decisions"
 coordinate_mode = "grid_225_or_normalized_1000"
 temperature = 0.0
 
+# Optional dedicated decision model (`gemini-decision-1`).
+# If `gemini-decision-1` is omitted or unavailable, `jikud` automatically emulates
+# the structured decision JSON contract (`noul`, `choice`, `score`) via the primary
+# text model (`[roles.planner]`) without error.
 [roles.decision_router]
 provider = "gemini"
 model = "gemini-decision-1"
 driver = "decisions"
+optional = true
+fallback_to_primary_text_model = true
 fast_path_confidence = 0.85
 require_none_or_other = true
 require_scope_gate = true
