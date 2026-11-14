@@ -3,7 +3,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# These gates validate the scaffold; they do not establish agent functionality.
+# Quality gates: metadata, actionlint, shellcheck, format, typecheck, clippy, and tests.
 check: infra-check fmt-check typecheck clippy test
 
 infra-check: metadata actionlint scripts-check

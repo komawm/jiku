@@ -1,6 +1,6 @@
 [package]
 name = "jiku-memory"
-description = "Reserved Jiku context and memory boundary; documentation-only scaffold"
+description = "Jiku three-tier context provider, perceptual frame hash ring, SQLite WAL+FTS5 store, and skill staging"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,10 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
 [lints]
 workspace = true
-

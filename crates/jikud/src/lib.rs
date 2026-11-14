@@ -1,9 +1,8 @@
-//! Pure-data model driver contracts and validation invariants for the Jiku
-//! desktop orchestration daemon (`jikud`).
+//! Desktop orchestration daemon (`jikud`), pure-data model driver contracts,
+//! Koma IPC integration, Phodopus Lua policy hooks, and JikuBox triage.
 //!
-//! This crate remains a library-only incubation scaffold prior to `v0.1.0`:
-//! network I/O, runtime daemon processes, policy execution, and Koma IPC
-//! integration are not implemented yet.
+//! Pre-`v0.1.0` incubation scope: real-time PipeWire audio streaming, production
+//! Landlock sandboxing, and Live2D/VRM avatar rendering remain targeted for `v0.1.0`.
 //!
 //! The contracts defined here capture the **Three-Driver Model Architecture**:
 //! 1. [`ModelDriverKind::Decisions`] — Structured single-pass multi-question
@@ -13,6 +12,13 @@
 //! 3. [`ModelDriverKind::LiveWebSocket`] — Stateful full-duplex WebSocket
 //!    streaming (`BidiGenerateContent`) for `jiku live` real-time voice/screen
 //!    co-piloting.
+
+pub mod config;
+pub mod daemon;
+pub mod drivers;
+pub mod jikubox;
+pub mod koma_ipc;
+pub mod lua_policy;
 
 use std::collections::HashSet;
 

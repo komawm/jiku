@@ -1,6 +1,6 @@
 [package]
 name = "jiku-tts"
-description = "Reserved Jiku speech synthesis boundary; documentation-only scaffold"
+description = "Jiku optional speech synthesis providers, lip-sync envelope extractors, and desktop notifications"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,11 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
 [lints]
 workspace = true
-

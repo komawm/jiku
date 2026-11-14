@@ -15,6 +15,31 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/komawm/jiku"
 homepage = "https://github.com/komawm"
 
+[workspace.dependencies]
+jiku-memory = { path = "crates/jiku-memory", version = "0.0.1" }
+jiku-tts = { path = "crates/jiku-tts", version = "0.0.1" }
+jikud = { path = "crates/jikud", version = "0.0.1" }
+
+# Pure-Rust stackless Lua 5.4 sandbox (Piccolo fork), matching Koma's reviewed commit.
+phodopus = { git = "https://github.com/Xuepoo/phodopus", rev = "f3d6a9b8ecdf829629daa688a4adbe08259b1b81", version = "0.2.0" }
+phodopus-util = { git = "https://github.com/Xuepoo/phodopus", rev = "f3d6a9b8ecdf829629daa688a4adbe08259b1b81", version = "0.2.0", features = ["serde"] }
+gc-arena = { git = "https://github.com/Xuepoo/phodopus", rev = "f3d6a9b8ecdf829629daa688a4adbe08259b1b81", package = "phodopus-gc-arena", version = "0.5.3" }
+
+anyhow = "1.0.104"
+base64 = "0.23.1"
+futures-util = "0.3"
+png = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+rustix = { version = "1.1.6", features = ["fs", "mm", "net", "process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
 [workspace.lints.rust]
 unused_must_use = "deny"
-

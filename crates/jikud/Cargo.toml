@@ -1,6 +1,6 @@
 [package]
 name = "jikud"
-description = "Reserved desktop orchestration daemon boundary; non-runnable scaffold"
+description = "Jiku desktop orchestration daemon, Three-Driver model clients, Phodopus Lua policy sandbox, and Koma IPC bridge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,30 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[[bin]]
+name = "jikud"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+gc-arena.workspace = true
+jiku-memory.workspace = true
+jiku-tts.workspace = true
+phodopus.workspace = true
+phodopus-util.workspace = true
+png.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true
-

@@ -1,4 +1,4 @@
-# ~/.config/jiku/config.toml — Static infrastructure & provider templates for jikud
+# ~/.config/jiku/config.toml — Infrastructure & provider defaults for jikud
 # Mounted Read-Only (ro) inside jikud's Bubblewrap / systemd ProtectHome=tmpfs sandbox.
 
 [daemon]
@@ -8,17 +8,23 @@ dropbox_dir = "~/JikuBox"
 audit_log = true
 
 [koma]
-default_workspace = "agent:work"
+default_workspace = "ws_01"
 default_overlay = "grid_225"
 perceptual_hash_threshold = 4
 allowed_app_profiles = ["chromium-research", "libreoffice-headless", "gimp-batch"]
 
-# --- Declarative LLM / Decision Model Provider Templates ---
+# --- Declarative LLM / Decision Model Providers ---
 
 [providers.gemini]
 kind = "google_gemini"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 api_key_env = "GEMINI_API_KEY"
+
+[providers.opencode_go]
+kind = "opencode_go"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_GO_API_KEY"
+thinking = false
 
 [providers.openai]
 kind = "openai_compatible"
@@ -39,13 +45,15 @@ api_key_env = "OPENROUTER_API_KEY"
 kind = "openai_compatible"
 base_url = "http://127.0.0.1:8080/v1"
 api_key_env = ""
+thinking = false
 
 # --- Heterogeneous Role Routing (Three-Driver Model Architecture) ---
 
 [roles.planner]
-provider = "gemini"
-model = "gemini-2.5-pro"
+provider = "opencode_go"
+model = "deepseek-v4.1-flash"
 driver = "turn_sse"
+thinking = false
 temperature = 0.2
 
 [roles.actor]
@@ -56,9 +64,9 @@ coordinate_mode = "grid_225_or_normalized_1000"
 temperature = 0.0
 
 # Optional dedicated decision model (`gemini-decision-1`).
-# If `gemini-decision-1` is omitted or unavailable, `jikud` automatically emulates
-# the structured decision JSON contract (`noul`, `choice`, `score`) via the primary
-# text model (`[roles.planner]`) without error.
+# If `GEMINI_API_KEY` or `gemini-decision-1` is omitted or unavailable, `jikud`
+# falls back to `[roles.planner]` (`deepseek-v4.1-flash`, thinking disabled)
+# via structured JSON emulation without error.
 [roles.decision_router]
 provider = "gemini"
 model = "gemini-decision-1"
@@ -71,13 +79,12 @@ require_none_or_other = true
 require_scope_gate = true
 
 # --- Decision Router & Compiler Policy (`DecisionRouterPolicy`) ---
-# All fields below have built-in `Default` implementations and can be customized.
 
 [decision_router]
 decision_provider = "gemini"
 decision_model_id = "gemini-decision-1"
-primary_provider = "gemini"
-primary_text_model_id = "gemini-2.5-pro"
+primary_provider = "opencode_go"
+primary_text_model_id = "deepseek-v4.1-flash"
 fast_path_confidence_threshold = 0.85
 max_questions_per_batch = 8
 
@@ -97,8 +104,7 @@ cols = 15
 rows = 15
 
 # --- Live Session Co-Pilot Configuration (`LiveSessionConfig`) ---
-# Defaults are 16 kHz uplink / 24 kHz downlink / 2 FPS screen capture;
-# sample rates (`8000..=48000` Hz) and screen FPS (`1..=60` FPS) are configurable.
+# Disabled until `jiku live` is invoked explicitly.
 
 [live_session]
 model = "gemini-2.5-flash-live"
@@ -118,6 +124,7 @@ require_koma_epoch_fence = true
 provider = "gemini"
 model = "gemini-2.5-flash-live"
 driver = "live_websocket"
+optional = true
 response_modality = "AUDIO"
 output_audio_transcription = true
 proactive_audio = true
@@ -134,6 +141,7 @@ default_tool_scheduling = "WHEN_IDLE"
 provider = "local_vlm"
 model = "qwen2.5-vl-3b-instruct"
 driver = "turn_sse"
+thinking = false
 optional = true
 
 # --- JikuBox Multimodal Dropzone Triage (DecisionsDriver) ---

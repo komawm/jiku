@@ -1,8 +1,7 @@
-//! Pure-data command-surface descriptors for the Jiku controller client (`jiku`).
-//!
-//! This library remains a non-runnable incubation scaffold prior to `v0.1.0`:
-//! no CLI binary, TUI loop, MCP server runtime, or socket transport is built
-//! yet.
+//! Command controller, daemon client, and MCP server (`jiku`) for `jikud`.
+
+pub mod client;
+pub mod mcp;
 
 /// Planned command surfaces exposed by the `jiku` client controller over the
 /// `jikud` orchestration daemon.
