@@ -30,23 +30,58 @@ kind = "openai_compatible"
 base_url = "http://127.0.0.1:8080/v1"
 api_key_env = ""
 
-# --- Heterogeneous Role Routing ---
+# --- Heterogeneous Role Routing (Three-Driver Model Architecture) ---
 
 [roles.planner]
 provider = "gemini"
 model = "gemini-2.5-pro"
+driver = "turn_sse"
 temperature = 0.2
 
 [roles.actor]
 provider = "gemini"
 model = "gemini-decision-1"
+driver = "decisions"
 coordinate_mode = "grid_225_or_normalized_1000"
 temperature = 0.0
+
+[roles.decision_router]
+provider = "gemini"
+model = "gemini-decision-1"
+driver = "decisions"
+fast_path_confidence = 0.85
+require_none_or_other = true
+require_scope_gate = true
+
+[roles.live_companion]
+provider = "gemini"
+model = "gemini-2.5-flash-live"
+driver = "live_websocket"
+response_modality = "AUDIO"
+output_audio_transcription = true
+proactive_audio = true
+uplink_pcm_hz = 16000
+downlink_pcm_hz = 24000
+max_screen_fps = 2
+trigger_tokens = 10000
+sliding_window_target_tokens = 2000
+session_resumption = true
+non_blocking_tools = true
+default_tool_scheduling = "WHEN_IDLE"
 
 [roles.fast_guard]
 provider = "local_vlm"
 model = "qwen2.5-vl-3b-instruct"
+driver = "turn_sse"
 optional = true
+
+# --- JikuBox Multimodal Dropzone Triage (DecisionsDriver) ---
+
+[jikubox.triage]
+driver = "decisions"
+model = "gemini-decision-1"
+max_questions_per_batch = 1000
+prefer_noul_checklists = true
 
 # --- Three-Tier Pluggable Memory (SQLite WAL + FTS5) ---
 
