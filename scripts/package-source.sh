@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build a source-only development prerelease archive for Jiku.
 # Produces jiku-<version>-src.tar.gz, RELEASE-MANIFEST.toml and SHA256SUMS.
-# Jiku is a library-only scaffold; the archive contains no runnable daemon.
+# Pre-v0.1.0 runtime archive containing jikud, jiku CLI/MCP, jiku-memory, and jiku-tts.
 set -euo pipefail
 
 usage() {
@@ -112,7 +112,7 @@ kind = "source"
 archive = "${archive}"
 license = "GPL-3.0-or-later"
 crates = [${crates}]
-note = "library-only scaffold; no runnable daemon"
+note = "pre-v0.1.0 development release containing jikud, jiku CLI/MCP, jiku-memory, and jiku-tts"
 EOF
 
 (cd -- "$out" && sha256sum -- "$archive" "$manifest" >"$sums")
