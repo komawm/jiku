@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jikud",
+    "crates/jiku",
+    "crates/jiku-memory",
+    "crates/jiku-tts",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.100"
+license = "GPL-3.0-or-later"
+license-file = "LICENSE"
+repository = "https://github.com/komawm/jiku"
+homepage = "https://github.com/komawm"
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+

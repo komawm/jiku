@@ -1,0 +1,15 @@
+[package]
+name = "jiku-tts"
+description = "Reserved Jiku speech synthesis boundary; documentation-only scaffold"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+

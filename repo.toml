@@ -1,0 +1,9 @@
+[repo]
+name = "jiku"
+kind = "core"
+lang = "rust"
+role = "Desktop orchestration agent and bundled skills"
+owner = "koma"
+repository = "https://github.com/komawm/jiku"
+docs = "https://github.com/komawm/docs"
+

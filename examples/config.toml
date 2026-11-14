@@ -1,0 +1,78 @@
+# ~/.config/jiku/config.toml — Static infrastructure & provider templates for jikud
+# Mounted Read-Only (ro) inside jikud's Bubblewrap / systemd ProtectHome=tmpfs sandbox.
+
+[daemon]
+locale = "zh-CN"
+socket_name = "jiku.sock"
+dropbox_dir = "~/JikuBox"
+audit_log = true
+
+[koma]
+default_workspace = "agent:work"
+default_overlay = "grid_225"
+perceptual_hash_threshold = 4
+allowed_app_profiles = ["chromium-research", "libreoffice-headless", "gimp-batch"]
+
+# --- Declarative LLM / Decision Model Provider Templates ---
+
+[providers.gemini]
+kind = "google_gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+
+[providers.openrouter]
+kind = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.local_vlm]
+kind = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+api_key_env = ""
+
+# --- Heterogeneous Role Routing ---
+
+[roles.planner]
+provider = "gemini"
+model = "gemini-2.5-pro"
+temperature = 0.2
+
+[roles.actor]
+provider = "gemini"
+model = "gemini-decision-1"
+coordinate_mode = "grid_225_or_normalized_1000"
+temperature = 0.0
+
+[roles.fast_guard]
+provider = "local_vlm"
+model = "qwen2.5-vl-3b-instruct"
+optional = true
+
+# --- Three-Tier Pluggable Memory (SQLite WAL + FTS5) ---
+
+[memory]
+backend = "sqlite_fts5"
+db_path = "~/.local/state/jiku/state.db"
+l0_frame_ring_size = 4
+app_quirk_max_chars = 600
+stage_new_skills = true
+
+# --- Desktop Notifications (D-Bus -> swaync) ---
+
+[notify]
+desktop_dbus = true
+app_name = "Jiku"
+notify_on = ["task_completed", "task_failed", "verification_needed", "skill_staged"]
+
+# --- Optional TTS & Live2D / VRM Companion EventBus ---
+
+[tts]
+enabled = false
+provider = "voicevox"
+endpoint = "http://127.0.0.1:50021"
+speaker_id = 3
+speak_on = ["task_completed", "verification_needed"]
+
+[avatar]
+emit_cues = true
+idle_gaze_follow_vseat = true

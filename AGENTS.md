@@ -1,0 +1,11 @@
+# Jiku guidance
+
+Jiku owns the proposed companion runtime boundary, configuration/service templates and internal skill directory. Canonical requirements remain in [koma-docs](https://github.com/komawm/docs). Koma's compositor/mechanism source remains in [Koma](https://github.com/komawm/koma). Follow the [workspace map](https://github.com/komawm/.github/blob/main/workspace/workspace.toml) and this repository's CarryCtx task ownership; no submodules are involved.
+
+The `jikud`, `jiku`, `jiku-memory` and `jiku-tts` packages are library-only scaffolding with `publish = false`; no Jiku executable exists yet. Do not describe examples, provider settings, planned CLI commands, filesystem restrictions or resource budgets as implemented. Preserve imported template bytes unless a scoped change requires editing them. `skills/` belongs inside Jiku; do not create a separate jiku-skills repository. Avatar work is deferred.
+
+Register named identities/sessions and scoped tasks/dependencies here before multi-step work. Checkpoint evidence and remaining work, end sessions cleanly, and verify state/files before acceptance. Delegated code uses worktrees after the first commit; pre-commit initialization uses explicitly disjoint scopes. See the [CarryCtx catalog](https://github.com/komawm/jiku/blob/main/.carryctx/README.md).
+
+Use the repository justfile for current gates. Do not describe library-only scaffolding as an implemented daemon or CLI. Target Rust 1.100.0/Rust 2024 and verified compatible dependencies; an older installed compiler is not target-build evidence. Incubation starts at 0.0.1 on 0.0.x before formal 0.1.0. All Jiku crates use GPL-3.0-or-later and inherit the workspace license metadata and single root LICENSE; preserve upstream terms and provenance.
+
+Keep canonical HTTPS README/AGENTS links. Use `/tmp/koma/` for disposable artifacts and ignored workspace `recording/` for retained evidence. Keep credentials, tokens and private screenshots out of commits. Do not activate `jikud.service`, alter the current desktop session or change host devices during initialization. Local work does not authorize remote publication; future authorized remote delivery requires Issue/task linkage, labels/milestones, independent CodeRabbit review and required CI before merge.

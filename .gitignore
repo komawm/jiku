@@ -1,0 +1,12 @@
+.carryctx/config.local.toml
+.worktrees/
+
+/target/
+/recording/
+/tmp/
+/.env
+/.env.*
+!/.env.example
+*.sock
+*.qcow2
+*.iso
