@@ -7,12 +7,41 @@ incubation line before a formal `0.1.0` release.
 
 ### Planned for `v0.1.0`
 
-- Live PipeWire hardware microphone capture and speaker playout for interactive
-  `jiku live` sessions.
-- Production Linux Landlock / systemd sandbox hardening verified on host targets.
-- Live2D / VRM companion rendering UI consuming `AvatarCue` streams.
+- Live PipeWire full-duplex hardware microphone I/O for interactive
+  `jiku live` voice sessions (TTS playout via `AudioPlaybackSink` is included
+  in `v0.0.1`).
+- Production Linux `Landlock` + `seccomp` / systemd sandbox enforcement
+  verified on host targets.
+- Native Wayland layer-shell companion renderer (`MMD` / `Inochi2D` overlays)
+  complementing the browser-hosted `jiku avatar serve` WebSocket VRM stage.
 
-## [0.0.1] - 2026-11-15
+## [0.0.1] - 2026-11-16
+
+### Added (trajectories, grounding, small-context compaction, TTS, avatar & MCP)
+
+- Multi-waypoint cursor trajectories (`vseat.path` / `vseat.stroke`),
+  `vseat.cursor_settle`, configurable `hover_glide_ms` cursor glides, and
+  automatic workspace lease release after `run_task`.
+- Situational AT-SPI2 UI accessibility tree capture and semantic action
+  dispatch (`jiku a11y snapshot` / `jiku a11y act` with `@snap:eN` refs) and
+  `SystemGroundingPack` context enrichment.
+- 4-stage `context_budget` compaction waterfall (`stage1_visual_roi_pruning`,
+  `stage2_a11y_skeleton_folding`, `stage3_episodic_l1_folding`, plus output
+  token reservation clamping via `jiku context inspect`) and tolerant balanced
+  JSON slice extraction for 2B VLMs in `decisions.rs`.
+- Reproducible `2x2` `VirtualPaint` decision vs. grounding ablation harness
+  (`jiku bench run --offline` and `--live`).
+- Modular speech synthesis and 20 ms RMS lip-sync cue extractor (`jiku-tts`:
+  `espeak_ng`, `irodori`, `voicevox`, `openai_speech`, and `noop` providers,
+  barge-in `AudioPlaybackSink`, `jiku tts <say|stop>`).
+- Companion avatar stage server (`jiku avatar serve [--bind <ADDR>] [--vrm <PATH>]`)
+  serving HTTP + WebSocket `Snapshot` / `AvatarCue` streams with `vseat`
+  idle gaze tracking (`idle_gaze_follow_vseat`).
+- Dual-framing (`Content-Length` + NDJSON) `jiku mcp` stdio server exposing 12
+  tools (`jiku_status`, `jiku_run_task`, `jiku_decide`, `jiku_plan`,
+  `jiku_box_classify`, `jiku_memory_search`, `jiku_skills_list`,
+  `jiku_a11y_snapshot`, `jiku_a11y_act`, `jiku_tts_say`,
+  `jiku_context_inspect`, `jiku_bench_run`).
 
 Initial runnable `0.0.x` development prerelease shipping multi-architecture
 (`x86_64-unknown-linux-gnu` and 16 KiB page-aligned `aarch64-unknown-linux-gnu`)
@@ -59,10 +88,12 @@ accepted `v0.1.0` product release.
 
 ### Known limits (deferred to `v0.1.0`)
 
-- Live PipeWire hardware microphone capture and speaker playout for interactive
+- Live PipeWire full-duplex hardware microphone I/O for interactive
   `jiku live` sessions.
-- Production Linux Landlock / systemd sandbox hardening verified on host targets.
-- Live2D / VRM companion rendering UI consuming `AvatarCue` streams.
+- Production Linux `Landlock` + `seccomp` / systemd sandbox enforcement
+  verified on host targets.
+- Native Wayland layer-shell companion renderer (`MMD` / `Inochi2D` overlays)
+  complementing the WebSocket `jiku avatar serve` stage.
 
 [Unreleased]: https://github.com/komawm/jiku/compare/v0.0.1...HEAD
 [0.0.1]: https://github.com/komawm/jiku/releases/tag/v0.0.1
