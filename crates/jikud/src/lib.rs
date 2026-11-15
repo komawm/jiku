@@ -15,9 +15,12 @@
 //!    streaming (`BidiGenerateContent`) for `jiku live` real-time voice/screen
 //!    co-piloting.
 
+pub mod a11y;
+pub mod bench_core;
 pub mod config;
 pub mod daemon;
 pub mod drivers;
+pub mod grounding;
 pub mod jikubox;
 pub mod koma_ipc;
 pub mod lua_policy;
