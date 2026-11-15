@@ -10,6 +10,7 @@ use jiku_memory::{DEFAULT_APP_QUIRK_MAX_CHARS, DEFAULT_L0_FRAME_RING_SIZE, expan
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use crate::context_budget::ContextConfig;
 use crate::{
     ContextWindowCompressionSpec, DEFAULT_FAST_PATH_CONFIDENCE, DEFAULT_SCREEN_FPS,
     DOWNLINK_AUDIO_SAMPLE_RATE_HZ, DecisionCompilerConfig, DecisionRouterPolicy,
@@ -64,6 +65,9 @@ pub struct JikuConfig {
     pub tts: TtsToml,
     /// Companion EventBus cue emission flags.
     pub avatar: AvatarToml,
+    /// Prompt token budgeting and progressive compaction settings (`[context]`).
+    #[serde(default)]
+    pub context: ContextConfig,
 }
 
 impl Default for JikuConfig {
@@ -139,6 +143,7 @@ impl Default for JikuConfig {
             notify: NotifyToml::default(),
             tts: TtsToml::default(),
             avatar: AvatarToml::default(),
+            context: ContextConfig::default(),
         }
     }
 }
@@ -489,6 +494,9 @@ pub struct RoleSpec {
     pub non_blocking_tools: Option<bool>,
     /// Tool scheduling mode (`INTERRUPT`, `WHEN_IDLE`, `SILENT`).
     pub default_tool_scheduling: Option<String>,
+    /// Optional model context window ceiling in tokens (overrides `[context].max_context_tokens`).
+    #[serde(default)]
+    pub max_context_tokens: Option<u32>,
 }
 
 /// `[daemon]` settings.
@@ -779,7 +787,7 @@ impl Default for NotifyToml {
 pub struct TtsToml {
     /// Master enable switch (false by default).
     pub enabled: bool,
-    /// Provider kind (`"voicevox"`, `"openai_speech"`, `"noop"`).
+    /// Provider kind (`"voicevox"`, `"openai_speech"`, `"espeak_ng"`, `"irodori"`, `"noop"`).
     pub provider: String,
     /// Local or remote endpoint URL.
     pub endpoint: String,
@@ -787,7 +795,16 @@ pub struct TtsToml {
     pub speaker_id: u32,
     /// Events triggering speech synthesis when enabled.
     pub speak_on: Vec<String>,
+    /// Preferred audio playback sink (`""` / `"auto"`, `"pw-play"`, `"aplay"`, `"silent"`, or command).
+    #[serde(default)]
+    pub audio_sink: String,
+    /// Provider-specific voice identifier (e.g. `espeak-ng` voice `"en"`, `"ja"`, or Irodori voice).
+    #[serde(default)]
+    pub voice: String,
 }
+
+/// Alias preserving external references to `TtsConfig`.
+pub type TtsConfig = TtsToml;
 
 impl Default for TtsToml {
     fn default() -> Self {
@@ -800,6 +817,8 @@ impl Default for TtsToml {
                 "task_completed".to_string(),
                 "verification_needed".to_string(),
             ],
+            audio_sink: String::new(),
+            voice: String::new(),
         }
     }
 }

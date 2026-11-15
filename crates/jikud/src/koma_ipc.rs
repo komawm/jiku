@@ -56,6 +56,45 @@ pub struct KomaRpcRequest {
     pub params: Value,
 }
 
+/// Compositor delivery disposition reported on IPC errors (`KOM-0027`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryDisposition {
+    /// Delivery status could not be determined.
+    #[default]
+    Unknown,
+    /// Compositor confirmed the request was rejected before applying input.
+    NotDelivered,
+    /// Input may or may not have reached the target surface.
+    DeliveryUncertain,
+    /// Input was injected without post-step visual confirmation.
+    DeliveredUnverified,
+    /// Input was injected and post-step verification succeeded.
+    DeliveredVerified,
+}
+
+/// Retry safety guidance paired with [`DeliveryDisposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryDisposition {
+    /// Re-issuing the RPC after re-observation is safe.
+    Safe,
+    /// Blind retry risks duplicating side effects.
+    Unsafe,
+    /// Retry safety could not be determined.
+    #[default]
+    Unknown,
+}
+
+/// Combined delivery and retry semantics attached to [`KomaRpcError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DeliverySemantics {
+    /// Whether the compositor applied the request prior to failing.
+    pub delivery: DeliveryDisposition,
+    /// Whether retrying the operation is considered safe.
+    pub retry: RetryDisposition,
+}
+
 /// Structured error object returned inside [`KomaRpcResponse::error`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
 #[error("[{code}] {message}")]
@@ -73,6 +112,9 @@ pub struct KomaRpcError {
     /// Whether retrying after re-observation is safe.
     #[serde(default)]
     pub retryable: Option<bool>,
+    /// Optional delivery/retry semantics (`KOM-0027`).
+    #[serde(default)]
+    pub disposition: Option<DeliverySemantics>,
 }
 
 /// Wire response envelope returned by Koma.
@@ -110,6 +152,51 @@ pub enum KomaIpcError {
     /// Remote compositor returned an explicit IPC error envelope.
     #[error("Koma RPC error: {0}")]
     Rpc(#[from] KomaRpcError),
+}
+
+impl KomaIpcError {
+    /// Returns structured delivery/retry semantics attached to a [`KomaRpcError`], if present.
+    #[must_use]
+    pub fn disposition(&self) -> Option<DeliverySemantics> {
+        match self {
+            Self::Rpc(rpc) => rpc.disposition,
+            _ => None,
+        }
+    }
+}
+
+/// Compositor hit-test & modal occlusion verification result (`vseat.hit_test`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KomaHitTestResult {
+    /// Whether sampled target coordinates reach the intended target window.
+    pub reaches_target: bool,
+    /// Target window identifier, if known.
+    #[serde(default)]
+    pub target_win_id: Option<String>,
+    /// Target Wayland `app_id`, if known.
+    #[serde(default)]
+    pub target_app_id: Option<String>,
+    /// Occluding/blocking window identifier, if blocked.
+    #[serde(default)]
+    pub blocking_win_id: Option<String>,
+    /// Occluding window Wayland `app_id`, if blocked.
+    #[serde(default)]
+    pub blocking_app_id: Option<String>,
+    /// Occluding window title, if blocked.
+    #[serde(default)]
+    pub blocking_title: Option<String>,
+    /// Occluding window rect `[x, y, width, height]`, if blocked.
+    #[serde(default)]
+    pub blocking_rect: Option<[i32; 4]>,
+    /// True if sampled window geometry remained stable during the hit-test pass.
+    #[serde(default)]
+    pub geometry_stable: bool,
+    /// Coordinates `[x, y]` sampled across the target region.
+    #[serde(default)]
+    pub sampled_points: Vec<[f64; 2]>,
+    /// Current cursor position `[x, y]`, if available.
+    #[serde(default)]
+    pub cursor_pos: Option<[f64; 2]>,
 }
 
 /// Window metadata summarized from `scene.inventory`.
@@ -810,6 +897,88 @@ impl KomaIpcClient {
             .get("epoch")
             .and_then(Value::as_u64)
             .unwrap_or(expected_epoch))
+    }
+
+    /// Emits a relative pointer motion delta via `vseat.relative_move`.
+    pub fn relative_move(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        dx: f64,
+        dy: f64,
+        modifiers: &[String],
+    ) -> Result<Value, KomaIpcError> {
+        self.call_rpc(
+            "vseat.relative_move",
+            json!({
+                "ws_id": ws_id,
+                "expected_epoch": expected_epoch,
+                "dx": dx,
+                "dy": dy,
+                "modifiers": modifiers,
+            }),
+        )
+    }
+
+    /// Dispatches smooth/discrete scroll wheel deltas via `vseat.wheel`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wheel(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        target: Option<Value>,
+        dx: f64,
+        dy: f64,
+        discrete_x: i32,
+        discrete_y: i32,
+        modifiers: &[String],
+    ) -> Result<Value, KomaIpcError> {
+        let mut params = serde_json::Map::new();
+        params.insert("ws_id".to_string(), json!(ws_id));
+        params.insert("expected_epoch".to_string(), json!(expected_epoch));
+        if let Some(target_val) = target {
+            params.insert("target".to_string(), target_val);
+        }
+        params.insert("dx".to_string(), json!(dx));
+        params.insert("dy".to_string(), json!(dy));
+        params.insert("discrete_x".to_string(), json!(discrete_x));
+        params.insert("discrete_y".to_string(), json!(discrete_y));
+        params.insert("modifiers".to_string(), json!(modifiers));
+        self.call_rpc("vseat.wheel", Value::Object(params))
+    }
+
+    /// Probes modal occlusion and surface stability at `target` via `vseat.hit_test`.
+    pub fn hit_test(
+        &mut self,
+        ws_id: &str,
+        target: Value,
+    ) -> Result<KomaHitTestResult, KomaIpcError> {
+        let res = self.call_rpc(
+            "vseat.hit_test",
+            json!({
+                "ws_id": ws_id,
+                "target": target,
+            }),
+        )?;
+        Ok(serde_json::from_value(res)?)
+    }
+
+    /// Sets or clears the compositor agent cursor status pill via `vseat.cursor_label`.
+    pub fn cursor_label(
+        &mut self,
+        ws_id: &str,
+        label: Option<&str>,
+        caret_rect: Option<[f64; 4]>,
+    ) -> Result<Value, KomaIpcError> {
+        let mut params = serde_json::Map::new();
+        params.insert("ws_id".to_string(), json!(ws_id));
+        if let Some(lbl) = label {
+            params.insert("label".to_string(), json!(lbl));
+        }
+        if let Some(rect) = caret_rect {
+            params.insert("caret_rect".to_string(), json!(rect));
+        }
+        self.call_rpc("vseat.cursor_label", Value::Object(params))
     }
 
     #[cfg(test)]
@@ -1591,5 +1760,121 @@ mod tests {
                 "expected_epoch": 12
             })
         );
+    }
+
+    #[test]
+    fn koma_ipc_supports_relative_move_wheel_hit_test_cursor_label_and_disposition() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut ipc = KomaIpcClient::from_test_stream(client);
+
+        let srv_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut captured = Vec::new();
+            for step in 0..5 {
+                let req = read_test_rpc_request(&server, &mut buf).unwrap();
+                let resp = match req.method.as_str() {
+                    "vseat.relative_move" => KomaRpcResponse {
+                        id: req.id,
+                        result: Some(json!({ "epoch": 21 })),
+                        error: None,
+                    },
+                    "vseat.wheel" => KomaRpcResponse {
+                        id: req.id,
+                        result: Some(json!({ "epoch": 22 })),
+                        error: None,
+                    },
+                    "vseat.hit_test" => KomaRpcResponse {
+                        id: req.id,
+                        result: Some(json!({
+                            "reaches_target": false,
+                            "target_win_id": "win_1_g1",
+                            "target_app_id": "virtual-paint",
+                            "blocking_win_id": "win_2_g1",
+                            "blocking_app_id": "dialog-app",
+                            "blocking_title": "Confirm Save",
+                            "blocking_rect": [100, 100, 200, 120],
+                            "geometry_stable": true,
+                            "sampled_points": [[220.0, 180.0]],
+                            "cursor_pos": [220.0, 180.0]
+                        })),
+                        error: None,
+                    },
+                    "vseat.cursor_label" => KomaRpcResponse {
+                        id: req.id,
+                        result: Some(json!({ "ok": true })),
+                        error: None,
+                    },
+                    "vseat.click" => KomaRpcResponse {
+                        id: req.id,
+                        result: None,
+                        error: Some(KomaRpcError {
+                            code: ERR_CODE_STALE_EPOCH,
+                            symbol: Some("ERR_STALE_EPOCH".to_string()),
+                            message: format!("stale epoch at step {step}"),
+                            current_epoch: Some(25),
+                            retryable: Some(true),
+                            disposition: Some(DeliverySemantics {
+                                delivery: DeliveryDisposition::NotDelivered,
+                                retry: RetryDisposition::Safe,
+                            }),
+                        }),
+                    },
+                    other => panic!("unexpected RPC method: {other}"),
+                };
+                captured.push(req);
+                write_test_rpc_response(&server, &resp, Vec::new()).unwrap();
+            }
+            captured
+        });
+
+        let r1 = ipc
+            .relative_move("ws_01", 20, -14.5, 8.0, &["shift".to_string()])
+            .unwrap();
+        assert_eq!(r1["epoch"], 21);
+
+        let r2 = ipc
+            .wheel(
+                "ws_01",
+                21,
+                Some(json!({"x": 300.0, "y": 240.0})),
+                0.0,
+                -15.0,
+                0,
+                -1,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(r2["epoch"], 22);
+
+        let ht = ipc
+            .hit_test("ws_01", json!({"x": 220.0, "y": 180.0}))
+            .unwrap();
+        assert!(!ht.reaches_target);
+        assert_eq!(ht.blocking_app_id.as_deref(), Some("dialog-app"));
+        assert_eq!(ht.blocking_rect, Some([100, 100, 200, 120]));
+        assert!(ht.geometry_stable);
+
+        let cl = ipc
+            .cursor_label("ws_01", Some("Painting"), Some([10.0, 20.0, 2.0, 16.0]))
+            .unwrap();
+        assert_eq!(cl["ok"], true);
+
+        let err = ipc
+            .call_rpc("vseat.click", json!({"ws_id": "ws_01"}))
+            .unwrap_err();
+        assert_eq!(
+            err.disposition(),
+            Some(DeliverySemantics {
+                delivery: DeliveryDisposition::NotDelivered,
+                retry: RetryDisposition::Safe,
+            })
+        );
+
+        let reqs = srv_handle.join().unwrap();
+        assert_eq!(reqs.len(), 5);
+        assert_eq!(reqs[0].method, "vseat.relative_move");
+        assert_eq!(reqs[1].method, "vseat.wheel");
+        assert_eq!(reqs[2].method, "vseat.hit_test");
+        assert_eq!(reqs[3].method, "vseat.cursor_label");
     }
 }

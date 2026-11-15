@@ -9,10 +9,16 @@ use std::{
     process,
 };
 
-use jiku::client::{JikuClient, JikuClientOptions};
-use jiku::mcp::{run_mcp_loop, tool_definitions};
+use jiku::{
+    avatar_stage::{
+        AvatarStageConfig, AvatarStageSnapshot, DEFAULT_AVATAR_STAGE_ADDR, serve_avatar_stage,
+    },
+    client::{JikuClient, JikuClientOptions},
+    mcp::{run_mcp_stdio, tool_definitions},
+};
 use jikud::{config::JikuConfig, daemon::RpcDecisionQuestion, lua_policy::JikuLuaPolicy};
-use serde_json::json;
+use serde_json::{Value, json};
+use tokio::sync::{broadcast, oneshot};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -37,6 +43,11 @@ COMMANDS:\n    \
     box classify [<DIR>]    Triage files in directory (default ~/JikuBox)\n    \
     memory search <QUERY>   Search L2 episodes with SQLite FTS5 BM25 ranking\n    \
     skills <SUBCMD>         Manage staged skills (list | diff | stage | approve)\n    \
+    tts <say|stop>          Synthesize/play speech or trigger immediate barge-in stop\n    \
+    avatar serve            Serve companion HTTP + WebSocket Live2D/VRM stage\n    \
+    a11y <snapshot|act>     Inspect normalized AT-SPI tree or execute semantic action\n    \
+    context inspect         Inspect context budget and progressive waterfall compaction\n    \
+    bench run               Run 2x2 Decision x Grounding VirtualPaint ablation benchmark\n    \
     mcp                     Run stdio JSON-RPC 2.0 MCP server (--stateless | --print-tools)"
     );
 }
@@ -254,7 +265,7 @@ async fn dispatch(globals: GlobalOpts, subcmd: &str, tail: &[String]) -> Result<
             let mut client = JikuClient::new(opts)?;
             let stdin = BufReader::new(io::stdin().lock());
             let stdout = BufWriter::new(io::stdout().lock());
-            run_mcp_loop(&mut client, stdin, stdout, stateless).await?;
+            run_mcp_stdio(&mut client, stdin, stdout, stateless).await?;
             Ok(())
         }
         "status" => {
@@ -663,6 +674,393 @@ async fn dispatch(globals: GlobalOpts, subcmd: &str, tail: &[String]) -> Result<
                     return Err(CmdError::Usage(format!(
                         "unknown skills subcommand `{other}`"
                     )));
+                }
+            }
+            Ok(())
+        }
+        "tts" => {
+            let Some((action, tts_tail)) = tail.split_first() else {
+                return Err(CmdError::Usage(
+                    "usage: jiku tts <say <text> [--emotion <e>] [--no-play] [--wav-out <PATH>] | stop>"
+                        .to_string(),
+                ));
+            };
+            let mut client = JikuClient::new(opts)?;
+            match action.as_str() {
+                "say" => {
+                    let mut emotion: Option<String> = None;
+                    let mut play = true;
+                    let mut wav_out: Option<PathBuf> = None;
+                    let mut text_parts = Vec::new();
+                    let mut it = tts_tail.iter().cloned();
+                    while let Some(arg) = it.next() {
+                        match arg.as_str() {
+                            "--emotion" => {
+                                emotion = Some(it.next().ok_or_else(|| {
+                                    CmdError::Usage("--emotion requires a value".to_string())
+                                })?);
+                            }
+                            "--no-play" => play = false,
+                            "--wav-out" => {
+                                let val = it.next().ok_or_else(|| {
+                                    CmdError::Usage("--wav-out requires a file path".to_string())
+                                })?;
+                                wav_out = Some(PathBuf::from(val));
+                            }
+                            s if s.starts_with('-') => {
+                                return Err(CmdError::Usage(format!(
+                                    "unknown tts say option `{s}`"
+                                )));
+                            }
+                            _ => text_parts.push(arg),
+                        }
+                    }
+                    let text = text_parts.join(" ");
+                    if text.trim().is_empty() {
+                        return Err(CmdError::Usage(
+                            "usage: jiku tts say <text> [--emotion <e>] [--no-play] [--wav-out <PATH>]"
+                                .to_string(),
+                        ));
+                    }
+                    let val = client
+                        .tts_say(&text, emotion.as_deref(), play, wav_out.as_deref())
+                        .await?;
+                    if globals.json {
+                        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+                    } else {
+                        println!(
+                            "provider={} duration_ms={} bytes={} played={}",
+                            val["provider"].as_str().unwrap_or("unknown"),
+                            val["duration_ms"].as_u64().unwrap_or(0),
+                            val["wav_bytes_len"].as_u64().unwrap_or(0),
+                            val["played"].as_bool().unwrap_or(false)
+                        );
+                    }
+                    Ok(())
+                }
+                "stop" => {
+                    if !tts_tail.is_empty() {
+                        return Err(CmdError::Usage("usage: jiku tts stop".to_string()));
+                    }
+                    let val = client.tts_stop().await?;
+                    if globals.json {
+                        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+                    } else {
+                        println!("stopped={}", val["stopped"].as_bool().unwrap_or(false));
+                    }
+                    Ok(())
+                }
+                other => Err(CmdError::Usage(format!(
+                    "unknown tts subcommand `{other}` (expected `say` or `stop`)"
+                ))),
+            }
+        }
+        "avatar" => {
+            let Some((action, av_tail)) = tail.split_first() else {
+                return Err(CmdError::Usage(
+                    "usage: jiku avatar serve [--bind <ADDR>] [--vrm <PATH>]".to_string(),
+                ));
+            };
+            if action != "serve" {
+                return Err(CmdError::Usage(format!(
+                    "unknown avatar subcommand `{action}` (expected `serve`)"
+                )));
+            }
+            let mut bind_addr = DEFAULT_AVATAR_STAGE_ADDR.to_string();
+            let mut vrm_path: Option<PathBuf> = None;
+            let mut it = av_tail.iter().cloned();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--bind" => {
+                        bind_addr = it.next().ok_or_else(|| {
+                            CmdError::Usage("--bind requires `<host>:<port>`".to_string())
+                        })?;
+                    }
+                    "--vrm" => {
+                        let p = it.next().ok_or_else(|| {
+                            CmdError::Usage("--vrm requires a file path".to_string())
+                        })?;
+                        vrm_path = Some(PathBuf::from(p));
+                    }
+                    other => {
+                        return Err(CmdError::Usage(format!(
+                            "unknown avatar serve option `{other}`"
+                        )));
+                    }
+                }
+            }
+            let mut client = JikuClient::new(opts)?;
+            let mut snapshot = AvatarStageSnapshot::default();
+            if let Ok(state) = client.avatar_state().await
+                && let Some(cue_val) = state.get("cue").filter(|v| !v.is_null())
+                && let Ok(cue) = serde_json::from_value(cue_val.clone())
+            {
+                snapshot.cue = cue;
+            }
+            let cfg = AvatarStageConfig {
+                bind_addr,
+                vrm_path,
+                companion_name: "Jiku".to_string(),
+            };
+            let (tx, _rx) = broadcast::channel(64);
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let emit_json = globals.json;
+            tokio::spawn(async move {
+                if let Ok(addr) = ready_rx.await {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "http_url": format!("http://{addr}/"),
+                                "ws_url": format!("ws://{addr}/ws"),
+                            }))
+                            .unwrap_or_default()
+                        );
+                    } else {
+                        println!("avatar stage listening on http://{addr}/ (ws://{addr}/ws)");
+                    }
+                }
+            });
+            serve_avatar_stage(cfg, snapshot, tx, Some(ready_tx), async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
+            Ok(())
+        }
+        "a11y" => {
+            let Some((action, a11y_tail)) = tail.split_first() else {
+                return Err(CmdError::Usage(
+                    "usage: jiku a11y <snapshot [--skeleton] [--root <REF>] | act <click|focus|set-value|type|read-value> <REF> [TEXT]>"
+                        .to_string(),
+                ));
+            };
+            let mut client = JikuClient::new(opts)?;
+            match action.as_str() {
+                "snapshot" => {
+                    let mut skeleton = false;
+                    let mut root_ref: Option<String> = None;
+                    let mut app_id = String::new();
+                    let mut window_title = String::new();
+                    let mut it = a11y_tail.iter().cloned();
+                    while let Some(arg) = it.next() {
+                        match arg.as_str() {
+                            "--skeleton" => skeleton = true,
+                            "--root" => {
+                                root_ref = Some(it.next().ok_or_else(|| {
+                                    CmdError::Usage("--root requires a `@snap:eN` ref".to_string())
+                                })?);
+                            }
+                            "--app-id" => {
+                                app_id = it.next().ok_or_else(|| {
+                                    CmdError::Usage("--app-id requires a value".to_string())
+                                })?;
+                            }
+                            "--title" => {
+                                window_title = it.next().ok_or_else(|| {
+                                    CmdError::Usage("--title requires a value".to_string())
+                                })?;
+                            }
+                            other => {
+                                return Err(CmdError::Usage(format!(
+                                    "unknown a11y snapshot option `{other}`"
+                                )));
+                            }
+                        }
+                    }
+                    let val = client
+                        .a11y_snapshot(skeleton, root_ref.as_deref(), &app_id, &window_title)
+                        .await?;
+                    if globals.json {
+                        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+                    } else {
+                        println!("{}", val["text_tree"].as_str().unwrap_or(""));
+                    }
+                    Ok(())
+                }
+                "act" => {
+                    let Some((act_kind, rest_args)) = a11y_tail.split_first() else {
+                        return Err(CmdError::Usage(
+                            "usage: jiku a11y act <click|focus|set-value|type|read-value> <REF> [TEXT]"
+                                .to_string(),
+                        ));
+                    };
+                    let Some((target_ref, text_args)) = rest_args.split_first() else {
+                        return Err(CmdError::Usage(
+                            "usage: jiku a11y act <click|focus|set-value|type|read-value> <REF> [TEXT]"
+                                .to_string(),
+                        ));
+                    };
+                    let text_val = if text_args.is_empty() {
+                        None
+                    } else {
+                        Some(text_args.join(" "))
+                    };
+                    let val = client
+                        .a11y_act(act_kind, target_ref, text_val.as_deref())
+                        .await?;
+                    if globals.json {
+                        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+                    } else {
+                        println!(
+                            "ok={} ref={} action={} detail={}",
+                            val["ok"].as_bool().unwrap_or(false),
+                            val["ref_id"].as_str().unwrap_or(target_ref),
+                            val["action"].as_str().unwrap_or(act_kind),
+                            val["value"]
+                                .as_str()
+                                .or_else(|| val["message"].as_str())
+                                .unwrap_or("ok")
+                        );
+                    }
+                    Ok(())
+                }
+                other => Err(CmdError::Usage(format!(
+                    "unknown a11y subcommand `{other}` (expected `snapshot` or `act`)"
+                ))),
+            }
+        }
+        "context" => {
+            let Some((action, ctx_tail)) = tail.split_first() else {
+                return Err(CmdError::Usage(
+                    "usage: jiku context inspect [--max-tokens <N>] [--sample-text <TEXT>]"
+                        .to_string(),
+                ));
+            };
+            if action != "inspect" {
+                return Err(CmdError::Usage(format!(
+                    "unknown context subcommand `{action}` (expected `inspect`)"
+                )));
+            }
+            let mut max_tokens: Option<u32> = None;
+            let mut sample_text: Option<String> = None;
+            let mut it = ctx_tail.iter().cloned();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--max-tokens" => {
+                        let val = it.next().ok_or_else(|| {
+                            CmdError::Usage("--max-tokens requires an integer".to_string())
+                        })?;
+                        max_tokens = Some(val.parse::<u32>().map_err(|_| {
+                            CmdError::Usage(format!("invalid --max-tokens `{val}`"))
+                        })?);
+                    }
+                    "--sample-text" => {
+                        sample_text = Some(it.next().ok_or_else(|| {
+                            CmdError::Usage("--sample-text requires a string".to_string())
+                        })?);
+                    }
+                    other => {
+                        return Err(CmdError::Usage(format!(
+                            "unknown context inspect option `{other}`"
+                        )));
+                    }
+                }
+            }
+            let mut client = JikuClient::new(opts)?;
+            let val = client
+                .context_inspect(max_tokens, sample_text.as_deref())
+                .await?;
+            if globals.json {
+                println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+            } else {
+                let sim = &val["simulated_report"];
+                println!(
+                    "max_ctx={} raw_tok={} compacted_tok={} clamped_out={} dropped_imgs={} truncated_a11y={} stages={}",
+                    sim["max_context_tokens"].as_u64().unwrap_or(0),
+                    sim["raw_prompt_tokens"].as_u64().unwrap_or(0),
+                    sim["compacted_prompt_tokens"].as_u64().unwrap_or(0),
+                    sim["clamped_max_output_tokens"].as_u64().unwrap_or(0),
+                    sim["dropped_images"].as_u64().unwrap_or(0),
+                    sim["truncated_a11y_nodes"].as_u64().unwrap_or(0),
+                    sim["stages_applied"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        "bench" => {
+            let Some((action, bench_tail)) = tail.split_first() else {
+                return Err(CmdError::Usage(
+                    "usage: jiku bench run [--offline|--live] [--endpoint <URL>] [--model <NAME>] [--provider <P>] [--max-context-tokens <N>] [--out-dir <DIR>]"
+                        .to_string(),
+                ));
+            };
+            if action != "run" {
+                return Err(CmdError::Usage(format!(
+                    "unknown bench subcommand `{action}` (expected `run`)"
+                )));
+            }
+            let mut offline = true;
+            let mut endpoint: Option<String> = None;
+            let mut model: Option<String> = None;
+            let mut provider: Option<String> = None;
+            let mut max_context_tokens: Option<u32> = None;
+            let mut out_dir: Option<PathBuf> = None;
+            let mut it = bench_tail.iter().cloned();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--offline" => offline = true,
+                    "--live" => offline = false,
+                    "--endpoint" => {
+                        endpoint = Some(it.next().ok_or_else(|| {
+                            CmdError::Usage("--endpoint requires a URL".to_string())
+                        })?);
+                    }
+                    "--model" => {
+                        model = Some(it.next().ok_or_else(|| {
+                            CmdError::Usage("--model requires a model name".to_string())
+                        })?);
+                    }
+                    "--provider" => {
+                        provider = Some(it.next().ok_or_else(|| {
+                            CmdError::Usage("--provider requires a provider key".to_string())
+                        })?);
+                    }
+                    "--max-context-tokens" => {
+                        let val = it.next().ok_or_else(|| {
+                            CmdError::Usage("--max-context-tokens requires an integer".to_string())
+                        })?;
+                        max_context_tokens = Some(val.parse::<u32>().map_err(|_| {
+                            CmdError::Usage(format!("invalid --max-context-tokens `{val}`"))
+                        })?);
+                    }
+                    "--out-dir" => {
+                        let val = it.next().ok_or_else(|| {
+                            CmdError::Usage("--out-dir requires a directory path".to_string())
+                        })?;
+                        out_dir = Some(PathBuf::from(val));
+                    }
+                    other => {
+                        return Err(CmdError::Usage(format!(
+                            "unknown bench run option `{other}`"
+                        )));
+                    }
+                }
+            }
+            let mut client = JikuClient::new(opts)?;
+            let val = client
+                .bench_run(
+                    offline,
+                    max_context_tokens,
+                    out_dir.as_deref(),
+                    provider.as_deref(),
+                    model.as_deref(),
+                    endpoint.as_deref(),
+                )
+                .await?;
+            if globals.json {
+                println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+            } else {
+                println!("{}", val["markdown"].as_str().unwrap_or(""));
+                if let Some(dir) = val["artifacts"]["out_dir"].as_str() {
+                    println!("Artifacts exported to: {dir}");
                 }
             }
             Ok(())

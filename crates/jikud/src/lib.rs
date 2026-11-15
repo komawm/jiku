@@ -17,7 +17,9 @@
 
 pub mod a11y;
 pub mod bench_core;
+pub mod bench_executor;
 pub mod config;
+pub mod context_budget;
 pub mod daemon;
 pub mod drivers;
 pub mod grounding;

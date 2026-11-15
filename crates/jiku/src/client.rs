@@ -311,4 +311,200 @@ impl JikuClient {
         }
         self.engine_mut()?.skills_approve(skill_id, promote_dir)
     }
+
+    /// Synthesizes (and optionally plays/saves) speech via `tts.say` RPC or standalone engine.
+    pub async fn tts_say(
+        &mut self,
+        text: &str,
+        emotion: Option<&str>,
+        play: bool,
+        wav_out: Option<&Path>,
+    ) -> anyhow::Result<Value> {
+        if let Some(res) = self
+            .try_daemon_rpc(
+                "tts.say",
+                json!({
+                    "text": text,
+                    "emotion": emotion,
+                    "play": play,
+                    "wav_out": wav_out.map(|p| p.display().to_string()),
+                }),
+            )
+            .await
+        {
+            return res;
+        }
+        self.engine_mut()?
+            .tts_say(text, emotion, play, wav_out)
+            .await
+    }
+
+    /// Aborts active audio playback immediately via `tts.stop` RPC or standalone engine.
+    pub async fn tts_stop(&mut self) -> anyhow::Result<Value> {
+        if let Some(res) = self.try_daemon_rpc("tts.stop", json!({})).await {
+            return res;
+        }
+        Ok(self.engine_mut()?.tts_stop())
+    }
+
+    /// Fetches the current companion `AvatarCue` and gaze coordinates via `avatar.state`.
+    pub async fn avatar_state(&mut self) -> anyhow::Result<Value> {
+        if let Some(res) = self.try_daemon_rpc("avatar.state", json!({})).await {
+            return res;
+        }
+        Ok(self.engine_mut()?.avatar_state())
+    }
+
+    /// Captures and normalizes an AT-SPI snapshot via `a11y.snapshot` RPC or standalone engine.
+    pub async fn a11y_snapshot(
+        &mut self,
+        skeleton: bool,
+        root_ref: Option<&str>,
+        app_id: &str,
+        window_title: &str,
+    ) -> anyhow::Result<Value> {
+        if let Some(res) = self
+            .try_daemon_rpc(
+                "a11y.snapshot",
+                json!({
+                    "skeleton": skeleton,
+                    "root_ref": root_ref,
+                    "app_id": app_id,
+                    "window_title": window_title,
+                }),
+            )
+            .await
+        {
+            return res;
+        }
+        self.engine_mut()?
+            .a11y_snapshot(skeleton, root_ref, app_id, window_title)
+            .await
+    }
+
+    /// Dispatches an AT-SPI semantic action on `@snap:eN` via `a11y.act` RPC or standalone engine.
+    pub async fn a11y_act(
+        &mut self,
+        action: &str,
+        target_ref: &str,
+        text: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        if let Some(res) = self
+            .try_daemon_rpc(
+                "a11y.act",
+                json!({
+                    "action": action,
+                    "target_ref": target_ref,
+                    "text": text,
+                }),
+            )
+            .await
+        {
+            return res;
+        }
+        self.engine_mut()?.a11y_act(action, target_ref, text).await
+    }
+
+    /// Inspects context budget config, last report, and waterfall compaction simulation.
+    pub async fn context_inspect(
+        &mut self,
+        max_tokens: Option<u32>,
+        sample_text: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        if let Some(res) = self
+            .try_daemon_rpc(
+                "context.inspect",
+                json!({
+                    "max_tokens": max_tokens,
+                    "sample_text": sample_text,
+                }),
+            )
+            .await
+        {
+            return res;
+        }
+        self.engine_mut()?.context_inspect(max_tokens, sample_text)
+    }
+
+    /// Runs the `2 x 2` Decision × Grounding VirtualPaint benchmark via `bench.run` RPC or standalone engine.
+    pub async fn bench_run(
+        &mut self,
+        offline: bool,
+        max_context_tokens: Option<u32>,
+        out_dir: Option<&Path>,
+        provider_override: Option<&str>,
+        model_override: Option<&str>,
+        endpoint_override: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        if let Some(res) = self
+            .try_daemon_rpc(
+                "bench.run",
+                json!({
+                    "offline": offline,
+                    "max_context_tokens": max_context_tokens,
+                    "out_dir": out_dir.map(|p| p.display().to_string()),
+                    "provider_override": provider_override,
+                    "model_override": model_override,
+                    "endpoint_override": endpoint_override,
+                }),
+            )
+            .await
+        {
+            return res;
+        }
+        self.engine_mut()?
+            .bench_run(
+                offline,
+                max_context_tokens,
+                out_dir,
+                provider_override,
+                model_override,
+                endpoint_override,
+            )
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_standalone_fallback_runs_tts_avatar_context_and_offline_bench() {
+        let mut client = JikuClient::new(JikuClientOptions {
+            socket_path: Some(PathBuf::from("/tmp/jiku-nonexistent-test.sock")),
+            in_memory_db: true,
+            ..JikuClientOptions::default()
+        })
+        .expect("init standalone client");
+
+        let say = client
+            .tts_say("Standalone fallback check", Some("neutral"), false, None)
+            .await
+            .expect("tts_say");
+        assert_eq!(say["ok"], true);
+
+        let av = client.avatar_state().await.expect("avatar_state");
+        assert_eq!(av["cue"]["emotion"], "neutral");
+
+        let stop = client.tts_stop().await.expect("tts_stop");
+        assert_eq!(stop["stopped"], false);
+
+        let ctx = client
+            .context_inspect(Some(4096), None)
+            .await
+            .expect("context_inspect");
+        let sim = &ctx["simulated_report"];
+        assert!(
+            sim["compacted_prompt_tokens"].as_u64().unwrap()
+                + sim["clamped_max_output_tokens"].as_u64().unwrap()
+                <= 4032
+        );
+
+        let bench = client
+            .bench_run(true, Some(4096), None, None, None, None)
+            .await
+            .expect("offline bench");
+        assert_eq!(bench["report"]["cells"].as_array().unwrap().len(), 4);
+    }
 }

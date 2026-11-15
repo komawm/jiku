@@ -391,6 +391,32 @@ impl DecisionExecutor {
             media_vec.push(m.clone());
         }
 
+        let sys_prompt = "You are Jiku's deterministic decision evaluator. Output strictly valid JSON with no commentary.".to_string();
+        let max_ctx = config
+            .roles
+            .get("decision_router")
+            .and_then(|r| r.max_context_tokens)
+            .or_else(|| planner_role.and_then(|r| r.max_context_tokens))
+            .unwrap_or(config.context.max_context_tokens);
+        let compaction_input = crate::context_budget::CompactionInput {
+            system_prompt: sys_prompt.clone(),
+            micro_system_prompt: Some(sys_prompt),
+            messages: vec![TurnMessage {
+                role: "user".to_string(),
+                text: full_prompt,
+                media: media_vec,
+            }],
+            grounding_pack: None,
+            a11y_snapshot: None,
+            episodic_history: Vec::new(),
+            l1_skill_snippets: Vec::new(),
+            requested_output_tokens: Some(1024),
+            max_context_tokens: Some(max_ctx),
+        };
+        let (compacted, _) =
+            crate::context_budget::compact_context_waterfall(&config.context, &compaction_input)
+                .map_err(DriverError::Validation)?;
+
         let turn_resp = self
             .turn
             .generate(
@@ -398,14 +424,10 @@ impl DecisionExecutor {
                 &TurnRequest {
                     provider_id: provider_id.to_string(),
                     model: model.to_string(),
-                    system_prompt: "You are Jiku's deterministic decision evaluator. Output strictly valid JSON with no commentary.".to_string(),
-                    messages: vec![TurnMessage {
-                        role: "user".to_string(),
-                        text: full_prompt,
-                        media: media_vec,
-                    }],
+                    system_prompt: compacted.system_prompt,
+                    messages: compacted.messages,
                     temperature: Some(0.0),
-                    max_tokens: Some(1024),
+                    max_tokens: Some(compacted.max_output_tokens),
                     json_object: true,
                     stream: false,
                     thinking_enabled,

@@ -15,8 +15,8 @@ use jiku_memory::{
     StagedSkillRecord, expand_tilde_path,
 };
 use jiku_tts::{
-    AvatarCue, AvatarEmotion, DesktopNotifier, NoopTtsProvider, OpenAiSpeechProvider, TtsProvider,
-    VoicevoxProvider,
+    AudioPlaybackSink, AudioSinkKind, AvatarCue, AvatarEmotion, DesktopNotifier, EspeakNgProvider,
+    IrodoriHttpProvider, NoopTtsProvider, OpenAiSpeechProvider, TtsProvider, VoicevoxProvider,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,14 +29,26 @@ use tokio::{
 use crate::{
     ControlPlaneRoute, DecisionBatchSpec, DecisionMediaSource, DecisionQuestionKind,
     GEMINI_DECISION_1_MODEL_ID, GridSpec, MANDATORY_CHOICE_FALLBACK,
+    a11y::{
+        A11yActionRequest, A11yAdapter, A11ySnapshot, AtSpiGdbusAdapter, SnapshotFilterOpts,
+        SnapshotStore, select_interaction_route,
+    },
+    bench_core::{DecisionAblationMode, OfflineBenchExecutor, run_2x2_ablation_suite},
+    bench_executor::{TurnModelBenchExecutor, write_bench_artifacts},
     config::JikuConfig,
+    context_budget::{
+        CompactionInput, ContextBudgetReport, DEFAULT_MICRO_SYSTEM_PROMPT,
+        compact_context_waterfall,
+    },
     drivers::{
         DriverMediaInput,
         decisions::{DecisionAnswer, DecisionBatchResponse, DecisionExecutor},
+        live::LiveServerEvent,
         turn::{
             TurnMessage, TurnModelClient, TurnRequest, TurnResponse, strip_markdown_json_fences,
         },
     },
+    grounding::{SystemGroundingPack, crop_centered_roi_png, render_calibrated_ruler_png},
     jikubox::{JikuBoxReport, classify_dropbox_dir},
     koma_ipc::{
         ERR_CODE_HUMAN_PREEMPTED, ERR_CODE_PROTECTED_SURFACE, ERR_CODE_STALE_EPOCH,
@@ -268,6 +280,40 @@ pub enum PlannedKomaStep {
         /// Chord descriptor understood by Koma.
         chord: String,
     },
+    /// Scroll wheel delta via `vseat.wheel`.
+    Wheel {
+        /// Optional window-local target X coordinate.
+        #[serde(default)]
+        x: Option<f64>,
+        /// Optional window-local target Y coordinate.
+        #[serde(default)]
+        y: Option<f64>,
+        /// Smooth horizontal scroll delta.
+        #[serde(default)]
+        dx: f64,
+        /// Smooth vertical scroll delta.
+        #[serde(default)]
+        dy: f64,
+        /// Discrete horizontal scroll steps.
+        #[serde(default)]
+        discrete_x: i32,
+        /// Discrete vertical scroll steps.
+        #[serde(default)]
+        discrete_y: i32,
+        /// Modifier keys held during wheel scrolling.
+        #[serde(default)]
+        modifiers: Vec<String>,
+    },
+    /// Emit relative pointer delta (`vseat.relative_move`).
+    RelativeMove {
+        /// Horizontal pointer delta.
+        dx: f64,
+        /// Vertical pointer delta.
+        dy: f64,
+        /// Modifier keys held during relative motion.
+        #[serde(default)]
+        modifiers: Vec<String>,
+    },
     /// Wait `ms` milliseconds for animations or client repaints to settle.
     WaitMs {
         /// Delay duration in milliseconds (clamped at execution time to 5000 ms).
@@ -399,6 +445,11 @@ pub struct JikuEngine {
     turn_client: TurnModelClient,
     notifier: DesktopNotifier,
     tts: Box<dyn TtsProvider>,
+    audio_sink: AudioPlaybackSink,
+    a11y_store: SnapshotStore,
+    a11y_adapter: Box<dyn A11yAdapter>,
+    last_context_report: Option<ContextBudgetReport>,
+    last_cursor_xy: Option<(f64, f64)>,
     last_avatar_cue: Option<AvatarCue>,
 }
 
@@ -429,6 +480,10 @@ impl JikuEngine {
             app_name: config.notify.app_name.clone(),
         };
         let tts = build_tts_provider(&config);
+        let audio_sink = AudioPlaybackSink::new(parse_audio_sink_kind(&config.tts.audio_sink));
+        let a11y_store = SnapshotStore::default();
+        let a11y_adapter: Box<dyn A11yAdapter> =
+            Box::new(AtSpiGdbusAdapter::default().graceful_empty(true));
 
         Ok(Self {
             config,
@@ -441,6 +496,11 @@ impl JikuEngine {
             turn_client,
             notifier,
             tts,
+            audio_sink,
+            a11y_store,
+            a11y_adapter,
+            last_context_report: None,
+            last_cursor_xy: None,
             last_avatar_cue: None,
         })
     }
@@ -449,6 +509,52 @@ impl JikuEngine {
     #[must_use]
     pub const fn config(&self) -> &JikuConfig {
         &self.config
+    }
+
+    /// Returns the most recent context compaction report emitted during planning, if any.
+    #[must_use]
+    pub const fn last_context_report(&self) -> Option<&ContextBudgetReport> {
+        self.last_context_report.as_ref()
+    }
+
+    /// Injects or updates the latest companion [`AvatarCue`] (e.g. from external Live/avatar state).
+    pub fn set_last_avatar_cue(&mut self, cue: Option<AvatarCue>) {
+        self.last_avatar_cue = cue;
+    }
+
+    /// Replaces the AT-SPI accessibility backend adapter (primarily for tests).
+    pub fn set_a11y_adapter(&mut self, adapter: Box<dyn A11yAdapter>) {
+        self.a11y_adapter = adapter;
+    }
+
+    /// Immediately aborts active audio playback on barge-in or human preemption
+    /// and updates `last_avatar_cue` to reflect the interrupted listening state.
+    pub fn handle_live_barge_in(&mut self) -> bool {
+        let stopped = self.audio_sink.stop_playback();
+        let prev_gaze = self.last_avatar_cue.as_ref().and_then(|c| c.gaze_uv);
+        self.last_avatar_cue = Some(AvatarCue {
+            emotion: AvatarEmotion::Idle,
+            gaze_uv: prev_gaze,
+            interrupted: true,
+            ..AvatarCue::default()
+        });
+        stopped
+    }
+
+    /// Synchronizes local audio playback and avatar cues with an incoming [`LiveServerEvent`].
+    pub fn apply_live_server_event(&mut self, event: &LiveServerEvent) -> bool {
+        match event {
+            LiveServerEvent::BargeInInterrupted { reset_cue } => {
+                let stopped = self.audio_sink.stop_playback();
+                self.last_avatar_cue = Some(reset_cue.clone());
+                stopped
+            }
+            LiveServerEvent::DownlinkAudioChunk { cue, .. } => {
+                self.last_avatar_cue = Some(cue.clone());
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Collects runtime health, model routing, memory metrics, and live Koma connectivity.
@@ -662,6 +768,7 @@ impl JikuEngine {
         let mut active_app_id = String::new();
         let mut active_title = String::new();
         let mut active_win_id = String::new();
+        let mut active_win_size: Option<(u32, u32)> = None;
         let mut captured: Option<KomaCapturedFrame> = None;
         let mut inventory: Vec<KomaWorkspaceSummary> = Vec::new();
 
@@ -677,6 +784,13 @@ impl JikuEngine {
                     active_app_id = win.app_id.clone();
                     active_title = win.title.clone();
                     active_win_id = win.win_id.clone();
+                    if let (Some(w), Some(h)) = (win.rect_w, win.rect_h) {
+                        active_win_size = Some((w, h));
+                    } else {
+                        active_win_size = Some((ws.viewport_width, ws.viewport_height));
+                    }
+                } else {
+                    active_win_size = Some((ws.viewport_width, ws.viewport_height));
                 }
             } else {
                 bail!("Koma reported zero active workspaces");
@@ -695,24 +809,73 @@ impl JikuEngine {
         }
 
         let mut injected_notes = Vec::new();
+        let mut l1_snippets = Vec::new();
         if !active_app_id.is_empty()
             && let Some(quirk) = self.memory.get_app_quirk(&active_app_id)?
         {
             injected_notes.push(format!("[L1 quirk:{active_app_id}] {}", quirk.notes));
+            l1_snippets.push(format!("[L1 quirk:{active_app_id}] {}", quirk.notes));
         }
         let prior_episodes = self.memory.search_episodes(goal, 3)?;
+        let mut episodic_lines = Vec::with_capacity(prior_episodes.len());
         for ep in &prior_episodes {
-            injected_notes.push(format!(
-                "[L2 prior #{} ({})] {}",
-                ep.id, ep.route, ep.summary
-            ));
+            let note = format!("[L2 prior #{} ({})] {}", ep.id, ep.route, ep.summary);
+            injected_notes.push(note.clone());
+            episodic_lines.push(note);
         }
         let lua_notes = self
             .lua_policy
             .run_prefetch(&active_app_id, &target_ws, goal)?;
         for note in lua_notes {
-            injected_notes.push(format!("[lua prefetch] {note}"));
+            let formatted = format!("[lua prefetch] {note}");
+            injected_notes.push(formatted.clone());
+            l1_snippets.push(formatted);
         }
+
+        let raw_a11y_nodes = self
+            .a11y_adapter
+            .snapshot_tree(&active_app_id, &active_title)
+            .await
+            .unwrap_or_default();
+        let a11y_snapshot = if raw_a11y_nodes.is_empty() {
+            None
+        } else {
+            Some(self.a11y_store.build_snapshot(
+                &active_app_id,
+                &active_title,
+                raw_a11y_nodes,
+                &SnapshotFilterOpts::default(),
+            ))
+        };
+
+        let route_decision = select_interaction_route(
+            &active_app_id,
+            &active_title,
+            goal,
+            a11y_snapshot
+                .as_ref()
+                .map_or(0, A11ySnapshot::actionable_count),
+            false,
+        );
+        let grounding_pack = captured.as_ref().map(|frame| {
+            let win_dims = active_win_size.unwrap_or((frame.width, frame.height));
+            SystemGroundingPack {
+                route: route_decision.clone(),
+                cursor_xy: self.last_cursor_xy,
+                active_window_size: win_dims,
+                hit_test_summary: Some(if frame.has_protected_blackout {
+                    "protected_blackout".to_string()
+                } else {
+                    "clear_unoccluded".to_string()
+                }),
+                top_a11y_entries: a11y_snapshot
+                    .as_ref()
+                    .map(|s| s.entries.iter().take(24).cloned().collect())
+                    .unwrap_or_default(),
+                last_diff: None,
+                canvas_bounds: None,
+            }
+        });
 
         let initial_epoch = captured.as_ref().map(|f| f.epoch);
         let has_protected_blackout = captured.as_ref().is_some_and(|f| f.has_protected_blackout);
@@ -899,11 +1062,50 @@ impl JikuEngine {
             .get(&provider_id)
             .with_context(|| format!("missing planner provider `{provider_id}`"))?;
         let thinking_enabled = self.config.resolve_thinking_enabled(role, provider);
+        let role_max_ctx = role
+            .and_then(|r| r.max_context_tokens)
+            .unwrap_or(self.config.context.max_context_tokens);
 
         let mut media_vec = Vec::new();
-        if let Some(m) = media_input {
+        if let Some(frame) = &captured {
+            let ruler_png = render_calibrated_ruler_png(&frame.png_bytes, self.last_cursor_xy)
+                .unwrap_or_else(|_| frame.png_bytes.clone());
+            media_vec.push(DriverMediaInput::Inline {
+                mime_type: "image/png".to_string(),
+                bytes: ruler_png,
+            });
+            if let Some((cx, cy)) = self.last_cursor_xy
+                && let Ok(roi) = crop_centered_roi_png(&frame.png_bytes, cx, cy, 256)
+            {
+                // Push ROI crop last so small-context Stage 1 prioritizes keeping it.
+                media_vec.push(DriverMediaInput::Inline {
+                    mime_type: "image/png".to_string(),
+                    bytes: roi.png_bytes,
+                });
+            }
+        } else if let Some(m) = media_input {
             media_vec.push(m);
         }
+
+        let compaction_input = CompactionInput {
+            system_prompt: planner_system,
+            micro_system_prompt: Some(DEFAULT_MICRO_SYSTEM_PROMPT.to_string()),
+            messages: vec![TurnMessage {
+                role: "user".to_string(),
+                text: planner_user,
+                media: media_vec,
+            }],
+            grounding_pack,
+            a11y_snapshot,
+            episodic_history: episodic_lines,
+            l1_skill_snippets: l1_snippets,
+            requested_output_tokens: Some(self.config.context.reserved_output_tokens),
+            max_context_tokens: Some(role_max_ctx),
+        };
+        let (compacted, budget_report) =
+            compact_context_waterfall(&self.config.context, &compaction_input)
+                .map_err(|err| anyhow!("context compaction budget error: {err}"))?;
+        self.last_context_report = Some(budget_report);
 
         let planner_resp = self
             .turn_client
@@ -912,14 +1114,10 @@ impl JikuEngine {
                 &TurnRequest {
                     provider_id,
                     model,
-                    system_prompt: planner_system,
-                    messages: vec![TurnMessage {
-                        role: "user".to_string(),
-                        text: planner_user,
-                        media: media_vec,
-                    }],
+                    system_prompt: compacted.system_prompt,
+                    messages: compacted.messages,
                     temperature: Some(0.1),
-                    max_tokens: Some(8192),
+                    max_tokens: Some(compacted.max_output_tokens),
                     json_object: true,
                     stream: false,
                     thinking_enabled,
@@ -982,6 +1180,7 @@ impl JikuEngine {
                             tokio::time::sleep(Duration::from_millis(glide_ms + 30)).await;
                         }
                         Err(StepHalt::HumanPreempted) => {
+                            let _ = self.handle_live_barge_in();
                             halt_reason = Some("human_preempted".to_string());
                             executed_steps.push(ExecutedStepReport {
                                 step,
@@ -1001,6 +1200,11 @@ impl JikuEngine {
                         }
                         Err(StepHalt::Fatal(e)) => return Err(e),
                     }
+                }
+
+                if is_pointer_step(&step) {
+                    let label = short_step_label(&step);
+                    let _ = ipc.cursor_label(&target_ws, Some(&label), None);
                 }
 
                 let outcome = execute_step_with_epoch_retry(
@@ -1025,7 +1229,14 @@ impl JikuEngine {
                             settle_delay += Duration::from_millis(115);
                         }
                         if let Some(exit_wp) = step_terminal_waypoint(&step) {
+                            if let KomaPathWaypoint::Xy { x, y } = exit_wp {
+                                self.last_cursor_xy = Some((x, y));
+                            }
                             last_cursor_wp = Some(exit_wp);
+                        } else if let PlannedKomaStep::RelativeMove { dx, dy, .. } = &step
+                            && let Some((cx, cy)) = self.last_cursor_xy
+                        {
+                            self.last_cursor_xy = Some((cx + dx, cy + dy));
                         }
                         if !settle_delay.is_zero() {
                             tokio::time::sleep(settle_delay).await;
@@ -1037,6 +1248,7 @@ impl JikuEngine {
                         });
                     }
                     Err(StepHalt::HumanPreempted) => {
+                        let _ = self.handle_live_barge_in();
                         halt_reason = Some("human_preempted".to_string());
                         executed_steps.push(ExecutedStepReport {
                             step,
@@ -1057,6 +1269,7 @@ impl JikuEngine {
                     Err(StepHalt::Fatal(e)) => return Err(e),
                 }
             }
+            let _ = ipc.cursor_label(&target_ws, None, None);
             let _ = ipc.settle_cursor(&target_ws, false);
             if acquired_lease && glide_ms > 0 {
                 // Keep the lease alive across the 280 ms cursor settle fade-out.
@@ -1196,6 +1409,207 @@ impl JikuEngine {
         Ok(self.memory.approve_skill(skill_id, promote_dir)?)
     }
 
+    /// Synthesizes speech via configured TTS (falling back to `EspeakNgProvider`
+    /// with synthetic WAV fallback when `NoopTtsProvider` is active), updates
+    /// `last_avatar_cue`, optionally writes a `.wav` file, and plays via `audio_sink`.
+    pub async fn tts_say(
+        &mut self,
+        text: &str,
+        emotion: Option<&str>,
+        play: bool,
+        wav_out: Option<&Path>,
+    ) -> anyhow::Result<Value> {
+        if text.trim().is_empty() {
+            bail!("tts.say text must not be empty");
+        }
+        let parsed_emotion = emotion
+            .unwrap_or("neutral")
+            .parse::<AvatarEmotion>()
+            .unwrap_or(AvatarEmotion::Neutral);
+        let synth = if self.tts.provider_name() == "noop" {
+            let voice = if self.config.tts.voice.trim().is_empty() {
+                "en"
+            } else {
+                self.config.tts.voice.trim()
+            };
+            EspeakNgProvider::new(voice, 165)
+                .with_synthetic_fallback(true)
+                .synthesize(text, parsed_emotion)
+                .await?
+        } else {
+            self.tts.synthesize(text, parsed_emotion).await?
+        };
+
+        let wav_path_out = if let Some(path) = wav_out {
+            let expanded = expand_tilde_path(path);
+            if let Some(parent) = expanded.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&expanded, &synth.audio_bytes)?;
+            Some(expanded.display().to_string())
+        } else {
+            None
+        };
+
+        let played = if play && !synth.audio_bytes.is_empty() {
+            let sink = self.audio_sink.clone();
+            let audio = synth.audio_bytes.clone();
+            tokio::task::spawn_blocking(move || sink.play_wav_interruptible(&audio))
+                .await
+                .context("audio playback task panicked")??
+        } else {
+            false
+        };
+
+        self.last_avatar_cue = Some(synth.cue.clone());
+        Ok(json!({
+            "ok": true,
+            "provider": synth.provider,
+            "duration_ms": synth.duration_ms,
+            "wav_bytes_len": synth.audio_bytes.len(),
+            "viseme_count": synth.cue.mora_envelope.len(),
+            "frame_count": synth.envelope_timeline.len(),
+            "pcm_envelope": synth.cue.pcm_envelope,
+            "played": played,
+            "wav_out": wav_path_out,
+        }))
+    }
+
+    /// Immediately stops active audio playback (barge-in interruption).
+    pub fn tts_stop(&mut self) -> Value {
+        let stopped = self.handle_live_barge_in();
+        json!({ "stopped": stopped })
+    }
+
+    /// Returns the current companion [`AvatarCue`] and normalized gaze `(u, v)`.
+    #[must_use]
+    pub fn avatar_state(&self) -> Value {
+        json!({
+            "cue": self.last_avatar_cue,
+            "gaze_uv": self.last_avatar_cue.as_ref().and_then(|c| c.gaze_uv),
+        })
+    }
+
+    /// Captures and normalizes an AT-SPI accessibility snapshot.
+    pub async fn a11y_snapshot(
+        &mut self,
+        skeleton: bool,
+        root_ref: Option<&str>,
+        app_id: &str,
+        window_title: &str,
+    ) -> anyhow::Result<Value> {
+        let raw_nodes = self
+            .a11y_adapter
+            .snapshot_tree(app_id, window_title)
+            .await?;
+        let opts = SnapshotFilterOpts {
+            skeleton,
+            root_ref: root_ref.map(str::to_string),
+            ..SnapshotFilterOpts::default()
+        };
+        let snapshot = self
+            .a11y_store
+            .build_snapshot(app_id, window_title, raw_nodes, &opts);
+        let text_tree = snapshot.format_text_tree();
+        Ok(json!({
+            "snapshot": snapshot,
+            "text_tree": text_tree,
+        }))
+    }
+
+    /// Executes an AT-SPI semantic action on a snapshot-scoped `@snap:eN` reference.
+    pub async fn a11y_act(
+        &self,
+        action: &str,
+        target_ref: &str,
+        text: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let req = parse_a11y_action(action, text)?;
+        let res = self
+            .a11y_store
+            .execute_action(self.a11y_adapter.as_ref(), target_ref, req)
+            .await?;
+        Ok(serde_json::to_value(res)?)
+    }
+
+    /// Inspects current `[context]` configuration, last observed report, and runs a
+    /// progressive waterfall compaction simulation.
+    pub fn context_inspect(
+        &self,
+        max_tokens: Option<u32>,
+        sample_text: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let effective_max = max_tokens.unwrap_or(self.config.context.max_context_tokens);
+        let sim_input = if let Some(raw_text) = sample_text {
+            CompactionInput {
+                system_prompt: build_planner_system_prompt(),
+                micro_system_prompt: Some(DEFAULT_MICRO_SYSTEM_PROMPT.to_string()),
+                messages: vec![TurnMessage {
+                    role: "user".to_string(),
+                    text: raw_text.to_string(),
+                    media: Vec::new(),
+                }],
+                grounding_pack: None,
+                a11y_snapshot: None,
+                episodic_history: Vec::new(),
+                l1_skill_snippets: Vec::new(),
+                requested_output_tokens: Some(self.config.context.reserved_output_tokens),
+                max_context_tokens: Some(effective_max),
+            }
+        } else {
+            build_simulation_compaction_input(effective_max)
+        };
+        let (payload, simulated_report) =
+            compact_context_waterfall(&self.config.context, &sim_input)
+                .map_err(|err| anyhow!("context simulation failed: {err}"))?;
+        Ok(json!({
+            "config": self.config.context,
+            "last_report": self.last_context_report,
+            "simulated_report": simulated_report,
+            "clamped_max_output_tokens": payload.max_output_tokens,
+        }))
+    }
+
+    /// Executes the `2 x 2` Decision-Router × Grounding-Context VirtualPaint ablation benchmark.
+    pub async fn bench_run(
+        &self,
+        offline: bool,
+        max_context_tokens: Option<u32>,
+        out_dir: Option<&Path>,
+        provider_override: Option<&str>,
+        model_override: Option<&str>,
+        endpoint_override: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let report = if offline {
+            run_2x2_ablation_suite(
+                &OfflineBenchExecutor,
+                DecisionAblationMode::EmulatedDecision,
+            )
+            .await?
+        } else {
+            let exec = TurnModelBenchExecutor::new(
+                self.config.clone(),
+                provider_override,
+                model_override,
+                endpoint_override,
+                max_context_tokens,
+            )?;
+            run_2x2_ablation_suite(&exec, DecisionAblationMode::EmulatedDecision).await?
+        };
+        let artifacts = if let Some(dir) = out_dir {
+            Some(write_bench_artifacts(dir, &report)?)
+        } else {
+            None
+        };
+        Ok(json!({
+            "report": report,
+            "markdown": report.to_markdown(),
+            "artifacts": artifacts,
+        }))
+    }
+
     async fn dispatch_lifecycle_event(
         &mut self,
         event_name: &str,
@@ -1228,6 +1642,16 @@ impl JikuEngine {
         for line in utterances {
             if let Ok(synth) = self.tts.synthesize(&line, effective_emotion).await {
                 self.last_avatar_cue = Some(synth.cue);
+                if self.config.tts.enabled
+                    && !synth.audio_bytes.is_empty()
+                    && self.audio_sink.kind() != &AudioSinkKind::Silent
+                {
+                    let sink = self.audio_sink.clone();
+                    let audio = synth.audio_bytes;
+                    let _ =
+                        tokio::task::spawn_blocking(move || sink.play_wav_interruptible(&audio))
+                            .await;
+                }
             }
         }
 
@@ -1432,6 +1856,95 @@ impl JikuEngine {
                         })
                     },
                 )
+            }
+            "tts.say" => {
+                let text = req.params.get("text").and_then(Value::as_str).unwrap_or("");
+                let emotion = req.params.get("emotion").and_then(Value::as_str);
+                let play = req
+                    .params
+                    .get("play")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let wav_out = req
+                    .params
+                    .get("wav_out")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from);
+                self.tts_say(text, emotion, play, wav_out.as_deref()).await
+            }
+            "tts.stop" => Ok(self.tts_stop()),
+            "avatar.state" => Ok(self.avatar_state()),
+            "a11y.snapshot" => {
+                let skeleton = req
+                    .params
+                    .get("skeleton")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let root_ref = req.params.get("root_ref").and_then(Value::as_str);
+                let app_id = req
+                    .params
+                    .get("app_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let window_title = req
+                    .params
+                    .get("window_title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.a11y_snapshot(skeleton, root_ref, app_id, window_title)
+                    .await
+            }
+            "a11y.act" => {
+                let action = req
+                    .params
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let target_ref = req
+                    .params
+                    .get("target_ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let text = req.params.get("text").and_then(Value::as_str);
+                self.a11y_act(action, target_ref, text).await
+            }
+            "context.inspect" => {
+                let max_tokens = req
+                    .params
+                    .get("max_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
+                let sample_text = req.params.get("sample_text").and_then(Value::as_str);
+                self.context_inspect(max_tokens, sample_text)
+            }
+            "bench.run" => {
+                let offline = req
+                    .params
+                    .get("offline")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let max_context_tokens = req
+                    .params
+                    .get("max_context_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
+                let out_dir = req
+                    .params
+                    .get("out_dir")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from);
+                let provider_override = req.params.get("provider_override").and_then(Value::as_str);
+                let model_override = req.params.get("model_override").and_then(Value::as_str);
+                let endpoint_override = req.params.get("endpoint_override").and_then(Value::as_str);
+                self.bench_run(
+                    offline,
+                    max_context_tokens,
+                    out_dir.as_deref(),
+                    provider_override,
+                    model_override,
+                    endpoint_override,
+                )
+                .await
             }
             "shutdown" => {
                 should_shutdown = true;
@@ -1662,6 +2175,40 @@ const fn step_mutates_vseat(step: &PlannedKomaStep) -> bool {
     !matches!(step, PlannedKomaStep::WaitMs { .. })
 }
 
+const fn is_pointer_step(step: &PlannedKomaStep) -> bool {
+    matches!(
+        step,
+        PlannedKomaStep::ClickCell { .. }
+            | PlannedKomaStep::ClickXy { .. }
+            | PlannedKomaStep::DragXy { .. }
+            | PlannedKomaStep::DragCell { .. }
+            | PlannedKomaStep::MovePath { .. }
+            | PlannedKomaStep::DragPath { .. }
+            | PlannedKomaStep::Wheel { .. }
+            | PlannedKomaStep::RelativeMove { .. }
+    )
+}
+
+fn short_step_label(step: &PlannedKomaStep) -> String {
+    match step {
+        PlannedKomaStep::ClickCell { cell, .. } => format!("Click {cell}"),
+        PlannedKomaStep::ClickXy { x, y, .. } => format!("Click ({:.0},{:.0})", x, y),
+        PlannedKomaStep::DragXy { .. } => "Drag stroke".to_string(),
+        PlannedKomaStep::DragCell {
+            from_cell, to_cell, ..
+        } => {
+            format!("Drag {from_cell}->{to_cell}")
+        }
+        PlannedKomaStep::MovePath { .. } => "Hover glide".to_string(),
+        PlannedKomaStep::DragPath { .. } => "Draw path".to_string(),
+        PlannedKomaStep::Wheel { .. } => "Scroll wheel".to_string(),
+        PlannedKomaStep::RelativeMove { .. } => "Relative aim".to_string(),
+        PlannedKomaStep::InjectText { .. } => "Type text".to_string(),
+        PlannedKomaStep::Key { chord } => format!("Key {chord}"),
+        PlannedKomaStep::WaitMs { ms } => format!("Wait {ms}ms"),
+    }
+}
+
 fn execute_step_with_epoch_retry(
     ipc: &mut KomaIpcClient,
     ws_id: &str,
@@ -1801,6 +2348,41 @@ fn execute_step_with_epoch_retry(
                 ),
                 PlannedKomaStep::Key { chord } => (
                     client.tap_key(ws_id, epoch, chord),
+                    Duration::from_millis(20),
+                ),
+                PlannedKomaStep::Wheel {
+                    x,
+                    y,
+                    dx,
+                    dy,
+                    discrete_x,
+                    discrete_y,
+                    modifiers,
+                } => {
+                    let target = x.and_then(|xv| {
+                        y.filter(|yv| xv.is_finite() && yv.is_finite())
+                            .map(|yv| json!({ "x": xv, "y": yv }))
+                    });
+                    (
+                        client
+                            .wheel(
+                                ws_id,
+                                epoch,
+                                target,
+                                *dx,
+                                *dy,
+                                *discrete_x,
+                                *discrete_y,
+                                modifiers,
+                            )
+                            .map(|v| v.get("epoch").and_then(Value::as_u64).unwrap_or(epoch)),
+                        Duration::from_millis(25),
+                    )
+                }
+                PlannedKomaStep::RelativeMove { dx, dy, modifiers } => (
+                    client
+                        .relative_move(ws_id, epoch, *dx, *dy, modifiers)
+                        .map(|v| v.get("epoch").and_then(Value::as_u64).unwrap_or(epoch)),
                     Duration::from_millis(20),
                 ),
                 PlannedKomaStep::WaitMs { .. } => unreachable!("handled prior to RPC retry loop"),
@@ -1974,21 +2556,148 @@ async fn read_daemon_frame<T: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_slice(&buf)?)
 }
 
+/// Parses `[tts].audio_sink` strings (`"pw-play"`, `"aplay"`, `"silent"`, `"auto"` / `""`, or
+/// a custom command) into [`AudioSinkKind`].
+#[must_use]
+pub fn parse_audio_sink_kind(raw: &str) -> AudioSinkKind {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => AudioSinkKind::Auto,
+        "pw-play" | "pwplay" => AudioSinkKind::PwPlay,
+        "aplay" => AudioSinkKind::Aplay,
+        "silent" | "none" | "disabled" => AudioSinkKind::Silent,
+        _ => AudioSinkKind::Command(raw.trim().to_string()),
+    }
+}
+
 fn build_tts_provider(config: &JikuConfig) -> Box<dyn TtsProvider> {
     if !config.tts.enabled {
         return Box::new(NoopTtsProvider::default());
     }
+    let voice = config.tts.voice.trim();
     match config.tts.provider.trim().to_ascii_lowercase().as_str() {
         "voicevox" => VoicevoxProvider::new(&config.tts.endpoint, config.tts.speaker_id)
             .map(|p| Box::new(p) as Box<dyn TtsProvider>)
             .unwrap_or_else(|_| Box::new(NoopTtsProvider::default())),
         "openai_speech" => {
             let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-            OpenAiSpeechProvider::new(&config.tts.endpoint, api_key, "gpt-4o-mini-tts", "alloy")
-                .map(|p| Box::new(p) as Box<dyn TtsProvider>)
-                .unwrap_or_else(|_| Box::new(NoopTtsProvider::default()))
+            let chosen_voice = if voice.is_empty() { "alloy" } else { voice };
+            OpenAiSpeechProvider::new(
+                &config.tts.endpoint,
+                api_key,
+                "gpt-4o-mini-tts",
+                chosen_voice,
+            )
+            .map(|p| Box::new(p) as Box<dyn TtsProvider>)
+            .unwrap_or_else(|_| Box::new(NoopTtsProvider::default()))
         }
+        "espeak" | "espeak-ng" | "espeak_ng" => {
+            let chosen_voice = if voice.is_empty() { "en" } else { voice };
+            Box::new(EspeakNgProvider::new(chosen_voice, 165).with_synthetic_fallback(true))
+        }
+        "irodori" | "irodori_tts" => IrodoriHttpProvider::new(&config.tts.endpoint)
+            .map(|p| {
+                let p = if voice.is_empty() {
+                    p
+                } else {
+                    p.with_voice(voice)
+                };
+                Box::new(p) as Box<dyn TtsProvider>
+            })
+            .unwrap_or_else(|_| Box::new(NoopTtsProvider::default())),
         _ => Box::new(NoopTtsProvider::default()),
+    }
+}
+
+fn parse_a11y_action(action: &str, text: Option<&str>) -> anyhow::Result<A11yActionRequest> {
+    let trimmed = action.trim();
+    if trimmed.is_empty() {
+        bail!("a11y.act action must not be empty");
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "click" => Ok(A11yActionRequest::Click),
+        "focus" => Ok(A11yActionRequest::Focus),
+        "read-value" | "read_value" | "read" => Ok(A11yActionRequest::ReadValue),
+        "type" | "type-text" | "type_text" => Ok(A11yActionRequest::TypeText {
+            text: text.unwrap_or_default().to_string(),
+        }),
+        "set-value" | "set_value" => Ok(A11yActionRequest::SetValue {
+            value: text.unwrap_or_default().to_string(),
+        }),
+        _ => Ok(A11yActionRequest::CustomAction {
+            name: trimmed.to_string(),
+        }),
+    }
+}
+
+fn build_simulation_compaction_input(max_ctx: u32) -> CompactionInput {
+    let fake_media = |tag: u8| DriverMediaInput::Inline {
+        mime_type: "image/png".to_string(),
+        bytes: vec![tag; 64],
+    };
+    let entries: Vec<crate::a11y::A11yEntry> = (1..=64)
+        .map(|i| crate::a11y::A11yEntry {
+            ref_id: format!("@s1:e{i}"),
+            raw_ref: format!("e{i}"),
+            role: if i % 2 == 0 { "button" } else { "panel" }.to_string(),
+            name: format!("Simulated UI Element {i} with detailed descriptor"),
+            value: None,
+            rect: Some([10, i * 16, 120, 28]),
+            actions: if i % 2 == 0 {
+                vec!["click".to_string()]
+            } else {
+                Vec::new()
+            },
+            depth: if i % 2 == 0 { 1 } else { 4 },
+            is_secure: false,
+            child_count: 0,
+        })
+        .collect();
+    let snap = A11ySnapshot {
+        snapshot_id: "s1".to_string(),
+        app_id: "virtual-paint".to_string(),
+        window_title: "Canvas Simulation".to_string(),
+        entries,
+        total_raw_nodes: 64,
+        collapsed_wrappers_count: 8,
+        truncated: false,
+        skeleton: false,
+        warning: None,
+        addresses: Default::default(),
+    };
+    let episodic_history: Vec<String> = (1..=45)
+        .map(|i| {
+            format!(
+                "Step {i} verbose log: hovered palette toolbar and painted test stroke #{i} -> pixel diff ok"
+            )
+        })
+        .collect();
+    let l1_skill_snippets = vec![
+        "Skill 1: Select palette color swatch before dragging smooth catmull_rom path across canvas bounds.".repeat(2),
+        "Skill 2: Dismiss any modal dialog occluding canvas before attempting stroke.".repeat(2),
+        "Skill 3: Verify canvas diff changed pixels exceed 200 after stroke completion.".repeat(2),
+    ];
+
+    CompactionInput {
+        system_prompt: build_planner_system_prompt(),
+        micro_system_prompt: Some(DEFAULT_MICRO_SYSTEM_PROMPT.to_string()),
+        messages: vec![
+            TurnMessage {
+                role: "user".to_string(),
+                text: "Previous observation turn.".to_string(),
+                media: vec![fake_media(1)],
+            },
+            TurnMessage {
+                role: "user".to_string(),
+                text: "Goal: Paint a smooth BLU curve across the canvas center.".to_string(),
+                media: vec![fake_media(2), fake_media(3)],
+            },
+        ],
+        grounding_pack: None,
+        a11y_snapshot: Some(snap),
+        episodic_history,
+        l1_skill_snippets,
+        requested_output_tokens: Some(768),
+        max_context_tokens: Some(max_ctx),
     }
 }
 
@@ -2199,12 +2908,14 @@ fn build_planner_system_prompt() -> String {
         "    {\"action\": \"drag_path\", \"points\": [[180, 260], [280, 190], [380, 260]], \"button\": \"left\", \"spline\": \"catmull_rom\", \"profile\": \"spring\", \"duration_ms\": 320},\n",
         "    {\"action\": \"inject_text\", \"text\": \"command without trailing newline\"},\n",
         "    {\"action\": \"key\", \"chord\": \"Return\"},\n",
+        "    {\"action\": \"wheel\", \"x\": 320, \"y\": 240, \"dx\": 0.0, \"dy\": -15.0, \"discrete_x\": 0, \"discrete_y\": -1},\n",
+        "    {\"action\": \"relative_move\", \"dx\": 24.0, \"dy\": -12.0},\n",
         "    {\"action\": \"wait_ms\", \"ms\": 150}\n",
         "  ],\n",
         "  \"candidate_skill\": null\n",
         "}\n",
         "Rules:\n",
-        "- Only use action values: \"click_cell\", \"click_xy\", \"drag_xy\", \"drag_cell\", \"move_path\", \"drag_path\", \"inject_text\", \"key\", \"wait_ms\".\n",
+        "- Only use action values: \"click_cell\", \"click_xy\", \"drag_xy\", \"drag_cell\", \"move_path\", \"drag_path\", \"inject_text\", \"key\", \"wheel\", \"relative_move\", \"wait_ms\".\n",
         "- Grid overlay cells use 15x15 labels A1..O15 (columns A..O left-to-right, rows 1..15 top-to-bottom).\n",
         "- When `Active window geometry: WxH at (X, Y)` is present, `click_xy`, `drag_xy`, `move_path`, and `drag_path` `points` coordinates are local to that active window (`0..W`, `0..H`).\n",
         "- For `drag_xy` / `drag_cell` / `move_path` / `drag_path`, `profile` may be \"spring\" (damped Hooke spring dynamics), \"bezier\", \"minimum_jerk\", or \"instant\".\n",
@@ -2647,6 +3358,7 @@ mod tests {
                         message: "epoch mismatch".to_string(),
                         current_epoch: Some(7),
                         retryable: Some(true),
+                        disposition: None,
                     }),
                 },
                 Vec::new(),
@@ -2910,6 +3622,9 @@ mod tests {
                         json!({ "ok": true, "epoch": 4, "waypoints": 3 }),
                         Vec::new(),
                     ),
+                    "vseat.wheel" => (json!({ "ok": true, "epoch": 4 }), Vec::new()),
+                    "vseat.relative_move" => (json!({ "ok": true, "epoch": 4 }), Vec::new()),
+                    "vseat.cursor_label" => (json!({ "ok": true }), Vec::new()),
                     "vseat.cursor_settle" => (json!({ "ok": true }), Vec::new()),
                     "lease.release" => (json!({ "epoch": 5 }), Vec::new()),
                     other => panic!("unexpected Koma RPC method in mock server: {other}"),
@@ -2940,6 +3655,7 @@ mod tests {
         config.daemon.audit_log = false;
         config.notify.desktop_dbus = false;
         config.tts.enabled = false;
+        config.tts.audio_sink = "silent".to_string();
         config.koma.hover_glide_ms = 0;
         config.validate().expect("test config validates");
 
@@ -2957,6 +3673,11 @@ mod tests {
                 app_name: "JikuTest".to_string(),
             },
             tts: Box::new(NoopTtsProvider::default()),
+            audio_sink: AudioPlaybackSink::new(AudioSinkKind::Silent),
+            a11y_store: SnapshotStore::default(),
+            a11y_adapter: Box::new(crate::a11y::MockA11yAdapter::with_roots(Vec::new())),
+            last_context_report: None,
+            last_cursor_xy: None,
             last_avatar_cue: None,
         }
     }
@@ -2986,17 +3707,21 @@ mod tests {
             vec![
                 "scene.inventory",
                 "capture.frame",
+                "vseat.cursor_label",
                 "vseat.path",
+                "vseat.cursor_label",
                 "vseat.cursor_settle",
                 "lease.release",
             ]
         );
+        assert_eq!(live_reqs[2].params["label"], "Draw path");
+        assert!(live_reqs[4].params.get("label").is_none());
         assert_eq!(
-            live_reqs[3].params,
+            live_reqs[5].params,
             json!({ "ws_id": "ws_01", "immediate": false })
         );
         assert_eq!(
-            live_reqs[4].params,
+            live_reqs[6].params,
             json!({ "ws_id": "ws_01", "expected_epoch": 4 })
         );
 
@@ -3043,15 +3768,328 @@ mod tests {
                 "scene.inventory",
                 "capture.frame",
                 "vseat.pointer_move",
+                "vseat.cursor_label",
                 "vseat.path",
+                "vseat.cursor_label",
                 "vseat.cursor_settle",
                 "lease.release",
             ]
         );
         assert_eq!(reqs[2].params["kinematics"]["duration_ms"], 20);
         assert_eq!(
-            reqs[5].params,
+            reqs[7].params,
             json!({ "ws_id": "ws_01", "expected_epoch": 4 })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn daemon_rpcs_handle_tts_avatar_a11y_context_and_offline_bench() {
+        let mock_addr = spawn_mock_openai_server().await;
+        let mut engine = build_test_engine(mock_addr);
+
+        // 1. Configure MockA11yAdapter + check TTS/Irodori config builder.
+        let mut tts_cfg = JikuConfig::default();
+        tts_cfg.tts.enabled = true;
+        tts_cfg.tts.provider = "espeak-ng".to_string();
+        tts_cfg.tts.voice = "ja".to_string();
+        tts_cfg.tts.audio_sink = "pw-play".to_string();
+        assert_eq!(build_tts_provider(&tts_cfg).provider_name(), "espeak_ng");
+        assert_eq!(
+            parse_audio_sink_kind(&tts_cfg.tts.audio_sink),
+            AudioSinkKind::PwPlay
+        );
+        tts_cfg.tts.provider = "irodori_tts".to_string();
+        assert_eq!(build_tts_provider(&tts_cfg).provider_name(), "irodori");
+
+        engine.set_a11y_adapter(Box::new(crate::a11y::MockA11yAdapter::with_roots(vec![
+            crate::a11y::A11yRawNode {
+                role: "button".to_string(),
+                name: "Submit Form".to_string(),
+                value: None,
+                description: None,
+                rect: Some([100, 120, 90, 32]),
+                states: vec!["showing".to_string(), "enabled".to_string()],
+                actions: vec!["click".to_string()],
+                bus_name: None,
+                object_path: None,
+                children: Vec::new(),
+            },
+        ])));
+
+        let out_dir = unique_temp_dir("jiku-daemon-bench");
+        let wav_path = out_dir.join("hello.wav");
+
+        // 2. Test tts.say, avatar.state, tts.stop (barge-in interrupt), a11y.*, context.inspect, bench.run via handle_rpc.
+        let (resp_say, _) = engine
+            .handle_rpc(&DaemonRpcRequest {
+                id: 1,
+                method: "tts.say".to_string(),
+                params: json!({
+                    "text": "Hello Koma companion",
+                    "emotion": "thinking",
+                    "play": false,
+                    "wav_out": wav_path.display().to_string()
+                }),
+            })
+            .await;
+        let say_res = resp_say.result.expect("tts.say result");
+        assert_eq!(say_res["ok"], true);
+        assert!(wav_path.is_file());
+
+        let (resp_avatar, _) = engine
+            .handle_rpc(&DaemonRpcRequest {
+                id: 2,
+                method: "avatar.state".to_string(),
+                params: json!({}),
+            })
+            .await;
+        let av_res = resp_avatar.result.expect("avatar.state result");
+        assert_eq!(av_res["cue"]["emotion"], "thinking");
+        assert_eq!(av_res["cue"]["interrupted"], false);
+
+        let (resp_stop, _) = engine
+            .handle_rpc(&DaemonRpcRequest {
+                id: 3,
+                method: "tts.stop".to_string(),
+                params: json!({}),
+            })
+            .await;
+        assert!(resp_stop.error.is_none());
+        let (resp_avatar_after, _) = engine
+            .handle_rpc(&DaemonRpcRequest {
+                id: 4,
+                method: "avatar.state".to_string(),
+                params: json!({}),
+            })
+            .await;
+        assert_eq!(
+            resp_avatar_after.result.unwrap()["cue"]["interrupted"],
+            true
+        );
+
+        let (resp_snap, _) = engine
+            .handle_rpc(&DaemonRpcRequest {
+                id: 5,
+                method: "a11y.snapshot".to_string(),
+                params: json!({ "skeleton": true }),
+            })
+            .await;
+        let snap_res = resp_snap.result.expect("a11y.snapshot");
+        let target_ref = snap_res["snapshot"]["entries"][0]["ref_id"]
+            .as_str()
+            .expect("entry ref_id")
+            .to_string();
+        assert!(
+            snap_res["text_tree"]
+                .as_str()
+                .unwrap()
+                .contains("Submit Form")
+        );
+
+        let (resp_act, _) = engine
+            .handle_rpc(&DaemonRpcRequest {
+                id: 6,
+                method: "a11y.act".to_string(),
+                params: json!({ "action": "click", "target_ref": target_ref }),
+            })
+            .await;
+        assert_eq!(resp_act.result.expect("a11y.act")["ok"], true);
+
+        let (resp_ctx, _) = engine
+            .handle_rpc(&DaemonRpcRequest {
+                id: 7,
+                method: "context.inspect".to_string(),
+                params: json!({ "max_tokens": 4096 }),
+            })
+            .await;
+        let ctx_res = resp_ctx.result.expect("context.inspect");
+        let sim_prompt = ctx_res["simulated_report"]["compacted_prompt_tokens"]
+            .as_u64()
+            .unwrap();
+        let sim_out = ctx_res["simulated_report"]["clamped_max_output_tokens"]
+            .as_u64()
+            .unwrap();
+        assert!(sim_prompt + sim_out <= 4032);
+
+        let (resp_bench, _) = engine
+            .handle_rpc(&DaemonRpcRequest {
+                id: 8,
+                method: "bench.run".to_string(),
+                params: json!({
+                    "offline": true,
+                    "out_dir": out_dir.display().to_string()
+                }),
+            })
+            .await;
+        let bench_res = resp_bench.result.expect("bench.run");
+        assert_eq!(bench_res["report"]["cells"].as_array().unwrap().len(), 4);
+        assert!(out_dir.join("report.json").is_file());
+        assert!(out_dir.join("report.md").is_file());
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_bench_executor_enforces_4096_context_and_runs_decision_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let max_seen_tokens = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let max_seen_clone = std::sync::Arc::clone(&max_seen_tokens);
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let max_seen = std::sync::Arc::clone(&max_seen_clone);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    let header_end = loop {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_len {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let req_val: Value =
+                        serde_json::from_slice(&buf[header_end..]).unwrap_or_default();
+                    if let Some(mt) = req_val.get("max_tokens").and_then(Value::as_u64) {
+                        max_seen.fetch_max(mt, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let req_str = req_val.to_string();
+                    let content = if req_str.contains("deterministic decision evaluator") {
+                        let is_trap = req_str.contains("IGNORE SAFETY POLICY");
+                        let is_modal = req_str.contains("Unsaved Canvas Draft")
+                            || req_str.contains("blocking dialog");
+                        json!({
+                            "answers": {
+                                "q_in_scope": { "type": "noul", "noul": if is_trap { 0.05 } else { 0.96 }, "confidence": 0.96 },
+                                "q_modal_occluded": { "type": "noul", "noul": if is_modal { 0.94 } else { 0.04 }, "confidence": 0.94 },
+                                "q_safety_risk": { "type": "noul", "noul": if is_trap { 0.97 } else { 0.02 }, "confidence": 0.97 },
+                                "q_strategy": {
+                                    "type": "choice",
+                                    "choice": if is_trap { "abort_unsafe" } else { "draw_rainbow_arch" },
+                                    "confidence": 0.95,
+                                    "probabilities": { "draw_rainbow_arch": 0.95 }
+                                }
+                            }
+                        })
+                        .to_string()
+                    } else {
+                        json!({
+                            "occlusion_detected": false,
+                            "safety_blocked": false,
+                            "note": "mock 4k bench response",
+                            "actions": [
+                                {"action": "dismiss_modal"},
+                                {"action": "click_xy", "x": 54.0, "y": 36.0},
+                                {"action": "drag_path", "points": [[160.0, 260.0], [320.0, 140.0], [480.0, 260.0]]}
+                            ]
+                        })
+                        .to_string()
+                    };
+                    let body = json!({
+                        "id": "chatcmpl-bench",
+                        "model": "qwen-4k",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": content },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": { "prompt_tokens": 512, "completion_tokens": 64, "total_tokens": 576 }
+                    })
+                    .to_string();
+                    let http = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(http.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        let engine = build_test_engine(addr);
+        let endpoint = format!("http://{addr}/v1");
+        let res = engine
+            .bench_run(
+                false,
+                Some(4096),
+                None,
+                Some("local_vlm"),
+                Some("qwen-4k"),
+                Some(&endpoint),
+            )
+            .await
+            .expect("live bench run");
+        assert_eq!(res["report"]["cells"].as_array().unwrap().len(), 4);
+        assert!(max_seen_tokens.load(std::sync::atomic::Ordering::SeqCst) <= 4032);
+    }
+
+    #[test]
+    fn wheel_and_relative_move_dispatch_over_koma_ipc() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut ipc = KomaIpcClient::from_test_stream(client);
+        let srv = spawn_mock_koma_server(server);
+
+        let mut epoch = 3;
+        execute_step_with_epoch_retry(
+            &mut ipc,
+            "ws_01",
+            &mut epoch,
+            &PlannedKomaStep::Wheel {
+                x: Some(320.0),
+                y: Some(240.0),
+                dx: 0.0,
+                dy: -15.0,
+                discrete_x: 0,
+                discrete_y: -1,
+                modifiers: vec!["ctrl".to_string()],
+            },
+            "grid_225",
+        )
+        .unwrap();
+        execute_step_with_epoch_retry(
+            &mut ipc,
+            "ws_01",
+            &mut epoch,
+            &PlannedKomaStep::RelativeMove {
+                dx: 12.5,
+                dy: -7.5,
+                modifiers: Vec::new(),
+            },
+            "grid_225",
+        )
+        .unwrap();
+        drop(ipc);
+
+        let reqs = srv.join().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].method, "vseat.wheel");
+        assert_eq!(reqs[1].method, "vseat.relative_move");
     }
 }
