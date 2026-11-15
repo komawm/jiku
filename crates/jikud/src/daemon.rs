@@ -46,7 +46,7 @@ use crate::{
 };
 
 const MAX_DAEMON_FRAME_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TASK_ACTIONS: usize = 48;
+const MAX_TASK_ACTIONS: usize = 64;
 
 /// Serializable decision question DTO accepted over `jiku.sock` and CLI/MCP surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -919,7 +919,7 @@ impl JikuEngine {
                         media: media_vec,
                     }],
                     temperature: Some(0.1),
-                    max_tokens: Some(4096),
+                    max_tokens: Some(8192),
                     json_object: true,
                     stream: false,
                     thinking_enabled,
@@ -954,7 +954,55 @@ impl JikuEngine {
                 });
             }
         } else if let Some(ipc) = ipc_opt.as_mut() {
+            let glide_ms = self.config.koma.hover_glide_ms.min(2_000);
+            let mut last_cursor_wp: Option<KomaPathWaypoint> = None;
+            let mut acquired_lease = false;
+
             for step in capped_steps {
+                if glide_ms > 0
+                    && let Some((entry_wp, _)) = step_entry_and_exit_waypoints(&step)
+                    && last_cursor_wp
+                        .as_ref()
+                        .is_none_or(|prev| !waypoints_close(prev, &entry_wp))
+                {
+                    let glide_res = run_ipc_with_epoch_retry(
+                        ipc,
+                        &target_ws,
+                        &mut current_epoch,
+                        &self.config.koma.default_overlay,
+                        |client, epoch| {
+                            client.pointer_move_waypoint(
+                                &target_ws, epoch, &entry_wp, "bezier", glide_ms,
+                            )
+                        },
+                    );
+                    match glide_res {
+                        Ok(()) => {
+                            acquired_lease = true;
+                            tokio::time::sleep(Duration::from_millis(glide_ms + 30)).await;
+                        }
+                        Err(StepHalt::HumanPreempted) => {
+                            halt_reason = Some("human_preempted".to_string());
+                            executed_steps.push(ExecutedStepReport {
+                                step,
+                                status: "halted_human_preempted".to_string(),
+                                epoch_after: Some(current_epoch),
+                            });
+                            break;
+                        }
+                        Err(StepHalt::ProtectedSurface) => {
+                            halt_reason = Some("protected_surface".to_string());
+                            executed_steps.push(ExecutedStepReport {
+                                step,
+                                status: "halted_protected_surface".to_string(),
+                                epoch_after: Some(current_epoch),
+                            });
+                            break;
+                        }
+                        Err(StepHalt::Fatal(e)) => return Err(e),
+                    }
+                }
+
                 let outcome = execute_step_with_epoch_retry(
                     ipc,
                     &target_ws,
@@ -963,7 +1011,22 @@ impl JikuEngine {
                     &self.config.koma.default_overlay,
                 );
                 match outcome {
-                    Ok(settle_delay) => {
+                    Ok(mut settle_delay) => {
+                        if step_mutates_vseat(&step) {
+                            acquired_lease = true;
+                        }
+                        if glide_ms > 0
+                            && matches!(
+                                step,
+                                PlannedKomaStep::ClickCell { .. } | PlannedKomaStep::ClickXy { .. }
+                            )
+                        {
+                            // Allow the 160 ms click pulse and expanding ripple to bloom visibly.
+                            settle_delay += Duration::from_millis(115);
+                        }
+                        if let Some(exit_wp) = step_terminal_waypoint(&step) {
+                            last_cursor_wp = Some(exit_wp);
+                        }
                         if !settle_delay.is_zero() {
                             tokio::time::sleep(settle_delay).await;
                         }
@@ -995,6 +1058,13 @@ impl JikuEngine {
                 }
             }
             let _ = ipc.settle_cursor(&target_ws, false);
+            if acquired_lease && glide_ms > 0 {
+                // Keep the lease alive across the 280 ms cursor settle fade-out.
+                tokio::time::sleep(Duration::from_millis(280)).await;
+            }
+            if acquired_lease && let Ok(ep) = ipc.release_lease(&target_ws, current_epoch) {
+                current_epoch = ep;
+            }
         }
 
         let mut staged_skill_id = None;
@@ -1450,14 +1520,12 @@ fn dispatch_path_step(
     ipc: &mut KomaIpcClient,
     ws_id: &str,
     expected_epoch: u64,
-    points: &[[f64; 2]],
-    cells: &[String],
+    waypoints: &[KomaPathWaypoint],
     button: Option<&str>,
     spline: &str,
     profile: &str,
     duration_ms: u64,
-) -> Result<(Result<u64, KomaIpcError>, Duration), StepHalt> {
-    let waypoints = resolve_path_waypoints(points, cells)?;
+) -> (Result<u64, KomaIpcError>, Duration) {
     let norm_spline = normalize_path_spline(spline);
     let norm_profile = normalize_kinematic_profile(profile);
     let dur = duration_ms.min(5_000);
@@ -1466,7 +1534,7 @@ fn dispatch_path_step(
         Some(btn) => ipc.drag_path(
             ws_id,
             expected_epoch,
-            &waypoints,
+            waypoints,
             btn,
             norm_spline,
             norm_profile,
@@ -1475,144 +1543,30 @@ fn dispatch_path_step(
         None => ipc.move_path(
             ws_id,
             expected_epoch,
-            &waypoints,
+            waypoints,
             norm_spline,
             norm_profile,
             dur,
         ),
     };
-    Ok((res, settle_delay))
+    (res, settle_delay)
 }
 
-fn execute_step_with_epoch_retry(
+fn run_ipc_with_epoch_retry<F>(
     ipc: &mut KomaIpcClient,
     ws_id: &str,
     current_epoch: &mut u64,
-    step: &PlannedKomaStep,
     default_overlay: &str,
-) -> Result<Duration, StepHalt> {
-    if let PlannedKomaStep::WaitMs { ms } = step {
-        return Ok(Duration::from_millis((*ms).min(5_000)));
-    }
-
+    mut op: F,
+) -> Result<(), StepHalt>
+where
+    F: FnMut(&mut KomaIpcClient, u64) -> Result<u64, KomaIpcError>,
+{
     for attempt in 0..=1 {
-        let (res, settle_delay) = match step {
-            PlannedKomaStep::ClickCell {
-                cell,
-                button,
-                clicks,
-            } => {
-                let normalized = normalize_grid_cell(cell)?;
-                (
-                    ipc.click_grid(ws_id, *current_epoch, &normalized, button, (*clicks).max(1)),
-                    Duration::from_millis(35),
-                )
-            }
-            PlannedKomaStep::ClickXy {
-                x,
-                y,
-                button,
-                clicks,
-            } => (
-                ipc.click_xy(ws_id, *current_epoch, *x, *y, button, (*clicks).max(1)),
-                Duration::from_millis(35),
-            ),
-            PlannedKomaStep::DragXy {
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-                button,
-                profile,
-                duration_ms,
-            } => {
-                let norm_profile = normalize_kinematic_profile(profile);
-                let dur = (*duration_ms).min(5_000);
-                (
-                    ipc.drag_xy(
-                        ws_id,
-                        *current_epoch,
-                        *from_x,
-                        *from_y,
-                        *to_x,
-                        *to_y,
-                        button,
-                        norm_profile,
-                        dur,
-                    ),
-                    drag_settle_delay(norm_profile, dur),
-                )
-            }
-            PlannedKomaStep::DragCell {
-                from_cell,
-                to_cell,
-                button,
-                profile,
-                duration_ms,
-            } => {
-                let norm_from = normalize_grid_cell(from_cell)?;
-                let norm_to = normalize_grid_cell(to_cell)?;
-                let norm_profile = normalize_kinematic_profile(profile);
-                let dur = (*duration_ms).min(5_000);
-                (
-                    ipc.drag_grid(
-                        ws_id,
-                        *current_epoch,
-                        &norm_from,
-                        &norm_to,
-                        button,
-                        norm_profile,
-                        dur,
-                    ),
-                    drag_settle_delay(norm_profile, dur),
-                )
-            }
-            PlannedKomaStep::MovePath {
-                points,
-                cells,
-                spline,
-                profile,
-                duration_ms,
-            }
-            | PlannedKomaStep::DragPath {
-                points,
-                cells,
-                spline,
-                profile,
-                duration_ms,
-                ..
-            } => {
-                let button = match step {
-                    PlannedKomaStep::DragPath { button, .. } => Some(button.as_str()),
-                    _ => None,
-                };
-                dispatch_path_step(
-                    ipc,
-                    ws_id,
-                    *current_epoch,
-                    points,
-                    cells,
-                    button,
-                    spline,
-                    profile,
-                    *duration_ms,
-                )?
-            }
-            PlannedKomaStep::InjectText { text } => (
-                ipc.inject_text(ws_id, *current_epoch, text),
-                Duration::from_millis(20),
-            ),
-            PlannedKomaStep::Key { chord } => (
-                ipc.tap_key(ws_id, *current_epoch, chord),
-                Duration::from_millis(20),
-            ),
-            PlannedKomaStep::WaitMs { .. } => unreachable!("handled prior to RPC retry loop"),
-        };
-
-        match res {
+        match op(ipc, *current_epoch) {
             Ok(new_epoch) => {
                 *current_epoch = new_epoch;
-                return Ok(settle_delay);
+                return Ok(());
             }
             Err(KomaIpcError::Rpc(err)) if err.code == ERR_CODE_HUMAN_PREEMPTED => {
                 return Err(StepHalt::HumanPreempted);
@@ -1632,6 +1586,230 @@ fn execute_step_with_epoch_retry(
     Err(StepHalt::Fatal(anyhow!(
         "exhausted stale-epoch retry budget on workspace `{ws_id}`"
     )))
+}
+
+fn step_entry_and_exit_waypoints(
+    step: &PlannedKomaStep,
+) -> Option<(KomaPathWaypoint, KomaPathWaypoint)> {
+    match step {
+        PlannedKomaStep::ClickCell { cell, .. } => {
+            let norm = normalize_grid_cell(cell).ok()?;
+            let wp = KomaPathWaypoint::Grid225(norm);
+            Some((wp.clone(), wp))
+        }
+        PlannedKomaStep::ClickXy { x, y, .. } if x.is_finite() && y.is_finite() => {
+            let wp = KomaPathWaypoint::Xy { x: *x, y: *y };
+            Some((wp.clone(), wp))
+        }
+        PlannedKomaStep::DragXy {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            ..
+        } if from_x.is_finite() && from_y.is_finite() && to_x.is_finite() && to_y.is_finite() => {
+            Some((
+                KomaPathWaypoint::Xy {
+                    x: *from_x,
+                    y: *from_y,
+                },
+                KomaPathWaypoint::Xy { x: *to_x, y: *to_y },
+            ))
+        }
+        PlannedKomaStep::DragCell {
+            from_cell, to_cell, ..
+        } => {
+            let norm_from = normalize_grid_cell(from_cell).ok()?;
+            let norm_to = normalize_grid_cell(to_cell).ok()?;
+            Some((
+                KomaPathWaypoint::Grid225(norm_from),
+                KomaPathWaypoint::Grid225(norm_to),
+            ))
+        }
+        PlannedKomaStep::DragPath { points, cells, .. } => {
+            let wps = resolve_path_waypoints(points, cells).ok()?;
+            let first = wps.first()?.clone();
+            let last = wps.last()?.clone();
+            Some((first, last))
+        }
+        _ => None,
+    }
+}
+
+fn step_terminal_waypoint(step: &PlannedKomaStep) -> Option<KomaPathWaypoint> {
+    if let Some((_, exit)) = step_entry_and_exit_waypoints(step) {
+        return Some(exit);
+    }
+    if let PlannedKomaStep::MovePath { points, cells, .. } = step {
+        return resolve_path_waypoints(points, cells)
+            .ok()
+            .and_then(|wps| wps.last().cloned());
+    }
+    None
+}
+
+fn waypoints_close(a: &KomaPathWaypoint, b: &KomaPathWaypoint) -> bool {
+    match (a, b) {
+        (KomaPathWaypoint::Grid225(ca), KomaPathWaypoint::Grid225(cb)) => ca == cb,
+        (KomaPathWaypoint::Xy { x: ax, y: ay }, KomaPathWaypoint::Xy { x: bx, y: by }) => {
+            (ax - bx).hypot(ay - by) <= 8.0
+        }
+        _ => false,
+    }
+}
+
+const fn step_mutates_vseat(step: &PlannedKomaStep) -> bool {
+    !matches!(step, PlannedKomaStep::WaitMs { .. })
+}
+
+fn execute_step_with_epoch_retry(
+    ipc: &mut KomaIpcClient,
+    ws_id: &str,
+    current_epoch: &mut u64,
+    step: &PlannedKomaStep,
+    default_overlay: &str,
+) -> Result<Duration, StepHalt> {
+    if let PlannedKomaStep::WaitMs { ms } = step {
+        return Ok(Duration::from_millis((*ms).min(5_000)));
+    }
+
+    let norm_cells = match step {
+        PlannedKomaStep::ClickCell { cell, .. } => {
+            Some((normalize_grid_cell(cell)?, String::new()))
+        }
+        PlannedKomaStep::DragCell {
+            from_cell, to_cell, ..
+        } => Some((
+            normalize_grid_cell(from_cell)?,
+            normalize_grid_cell(to_cell)?,
+        )),
+        _ => None,
+    };
+    let resolved_waypoints = match step {
+        PlannedKomaStep::MovePath { points, cells, .. }
+        | PlannedKomaStep::DragPath { points, cells, .. } => {
+            Some(resolve_path_waypoints(points, cells)?)
+        }
+        _ => None,
+    };
+
+    let mut settle_delay = Duration::ZERO;
+    run_ipc_with_epoch_retry(
+        ipc,
+        ws_id,
+        current_epoch,
+        default_overlay,
+        |client, epoch| {
+            let (res, delay) = match step {
+                PlannedKomaStep::ClickCell { button, clicks, .. } => {
+                    let normalized = &norm_cells.as_ref().expect("pre-validated click_cell").0;
+                    (
+                        client.click_grid(ws_id, epoch, normalized, button, (*clicks).max(1)),
+                        Duration::from_millis(35),
+                    )
+                }
+                PlannedKomaStep::ClickXy {
+                    x,
+                    y,
+                    button,
+                    clicks,
+                } => (
+                    client.click_xy(ws_id, epoch, *x, *y, button, (*clicks).max(1)),
+                    Duration::from_millis(35),
+                ),
+                PlannedKomaStep::DragXy {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    button,
+                    profile,
+                    duration_ms,
+                } => {
+                    let norm_profile = normalize_kinematic_profile(profile);
+                    let dur = (*duration_ms).min(5_000);
+                    (
+                        client.drag_xy(
+                            ws_id,
+                            epoch,
+                            *from_x,
+                            *from_y,
+                            *to_x,
+                            *to_y,
+                            button,
+                            norm_profile,
+                            dur,
+                        ),
+                        drag_settle_delay(norm_profile, dur),
+                    )
+                }
+                PlannedKomaStep::DragCell {
+                    button,
+                    profile,
+                    duration_ms,
+                    ..
+                } => {
+                    let (norm_from, norm_to) =
+                        norm_cells.as_ref().expect("pre-validated drag_cell");
+                    let norm_profile = normalize_kinematic_profile(profile);
+                    let dur = (*duration_ms).min(5_000);
+                    (
+                        client.drag_grid(
+                            ws_id,
+                            epoch,
+                            norm_from,
+                            norm_to,
+                            button,
+                            norm_profile,
+                            dur,
+                        ),
+                        drag_settle_delay(norm_profile, dur),
+                    )
+                }
+                PlannedKomaStep::MovePath {
+                    spline,
+                    profile,
+                    duration_ms,
+                    ..
+                }
+                | PlannedKomaStep::DragPath {
+                    spline,
+                    profile,
+                    duration_ms,
+                    ..
+                } => {
+                    let button = match step {
+                        PlannedKomaStep::DragPath { button, .. } => Some(button.as_str()),
+                        _ => None,
+                    };
+                    dispatch_path_step(
+                        client,
+                        ws_id,
+                        epoch,
+                        resolved_waypoints
+                            .as_deref()
+                            .expect("pre-validated path step"),
+                        button,
+                        spline,
+                        profile,
+                        *duration_ms,
+                    )
+                }
+                PlannedKomaStep::InjectText { text } => (
+                    client.inject_text(ws_id, epoch, text),
+                    Duration::from_millis(20),
+                ),
+                PlannedKomaStep::Key { chord } => (
+                    client.tap_key(ws_id, epoch, chord),
+                    Duration::from_millis(20),
+                ),
+                PlannedKomaStep::WaitMs { .. } => unreachable!("handled prior to RPC retry loop"),
+            };
+            settle_delay = delay;
+            res
+        },
+    )?;
+    Ok(settle_delay)
 }
 
 struct SocketUnlinkGuard {
@@ -2031,8 +2209,9 @@ fn build_planner_system_prompt() -> String {
         "- When `Active window geometry: WxH at (X, Y)` is present, `click_xy`, `drag_xy`, `move_path`, and `drag_path` `points` coordinates are local to that active window (`0..W`, `0..H`).\n",
         "- For `drag_xy` / `drag_cell` / `move_path` / `drag_path`, `profile` may be \"spring\" (damped Hooke spring dynamics), \"bezier\", \"minimum_jerk\", or \"instant\".\n",
         "- For `move_path` (hover) and `drag_path` (button-held stroke), specify 2..=128 waypoints via either `points` (`[[x, y], ...]`) or `cells` (`[\"C4\", ...]`), and `spline`: \"auto\", \"catmull_rom\" (for smooth multi-point curves, handwriting, circles, and freehand strokes), or \"bezier\".\n",
+        "- For painting curves, arcs, waves, hills, clouds, foliage, roofs, circles, or organic shapes, prefer `drag_path` with 3..=12 `[x, y]` waypoints, `\"spline\": \"catmull_rom\"`, `\"profile\": \"spring\"`, and `\"duration_ms\"` between 320 and 520 instead of breaking curves into straight `drag_xy` segments.\n",
         "- When the active window is already a terminal (such as foot) and you want to run a command, click the terminal center if unfocused or directly emit inject_text (without newline) followed by {\"action\": \"key\", \"chord\": \"Return\"}.\n",
-        "- Keep steps <= 48 and preserve exact text requested by the user."
+        "- Keep steps <= 64 and preserve exact text requested by the user."
     )
     .to_string()
 }
@@ -2239,7 +2418,7 @@ mod tests {
         assert_eq!(drag_settle_delay("bezier", 180), Duration::from_millis(230));
         assert_eq!(drag_settle_delay("instant", 180), Duration::from_millis(25));
         assert_eq!(normalize_kinematic_profile("Hooke"), "spring");
-        assert_eq!(MAX_TASK_ACTIONS, 48);
+        assert_eq!(MAX_TASK_ACTIONS, 64);
 
         let inv = vec![KomaWorkspaceSummary {
             ws_id: "ws_01".to_string(),
@@ -2726,11 +2905,13 @@ mod tests {
                             vec![memfd],
                         )
                     }
+                    "vseat.pointer_move" => (json!({ "ok": true, "epoch": 4 }), Vec::new()),
                     "vseat.path" => (
                         json!({ "ok": true, "epoch": 4, "waypoints": 3 }),
                         Vec::new(),
                     ),
                     "vseat.cursor_settle" => (json!({ "ok": true }), Vec::new()),
+                    "lease.release" => (json!({ "epoch": 5 }), Vec::new()),
                     other => panic!("unexpected Koma RPC method in mock server: {other}"),
                 };
                 write_test_rpc_response(
@@ -2759,6 +2940,7 @@ mod tests {
         config.daemon.audit_log = false;
         config.notify.desktop_dbus = false;
         config.tts.enabled = false;
+        config.koma.hover_glide_ms = 0;
         config.validate().expect("test config validates");
 
         JikuEngine {
@@ -2793,7 +2975,7 @@ mod tests {
             .await
             .expect("live run_task_with_ipc");
         assert_eq!(report_live.initial_epoch, Some(3));
-        assert_eq!(report_live.final_epoch, Some(4));
+        assert_eq!(report_live.final_epoch, Some(5));
         assert_eq!(report_live.executed_steps.len(), 1);
         assert_eq!(report_live.executed_steps[0].status, "ok");
 
@@ -2805,12 +2987,17 @@ mod tests {
                 "scene.inventory",
                 "capture.frame",
                 "vseat.path",
-                "vseat.cursor_settle"
+                "vseat.cursor_settle",
+                "lease.release",
             ]
         );
         assert_eq!(
             live_reqs[3].params,
             json!({ "ws_id": "ws_01", "immediate": false })
+        );
+        assert_eq!(
+            live_reqs[4].params,
+            json!({ "ws_id": "ws_01", "expected_epoch": 4 })
         );
 
         let (server_dry, client_dry) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2827,5 +3014,44 @@ mod tests {
         let dry_reqs = srv_dry.join().unwrap();
         let dry_methods: Vec<&str> = dry_reqs.iter().map(|r| r.method.as_str()).collect();
         assert_eq!(dry_methods, vec!["scene.inventory", "capture.frame"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_task_with_hover_glide_emits_pointer_move_and_releases_lease() {
+        let mock_addr = spawn_mock_openai_server().await;
+        let mut engine = build_test_engine(mock_addr);
+        engine.config.koma.hover_glide_ms = 20;
+
+        let (server_live, client_live) = std::os::unix::net::UnixStream::pair().unwrap();
+        let srv_live = spawn_mock_koma_server(server_live);
+        let ipc_live = KomaIpcClient::from_test_stream(client_live);
+
+        let report_live = engine
+            .run_task_with_ipc("ws_01", "Draw a smooth curve", false, true, Some(ipc_live))
+            .await
+            .expect("hover-glide run_task_with_ipc");
+        assert_eq!(report_live.initial_epoch, Some(3));
+        assert_eq!(report_live.final_epoch, Some(5));
+        assert_eq!(report_live.executed_steps.len(), 1);
+        assert_eq!(report_live.executed_steps[0].status, "ok");
+
+        let reqs = srv_live.join().unwrap();
+        let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec![
+                "scene.inventory",
+                "capture.frame",
+                "vseat.pointer_move",
+                "vseat.path",
+                "vseat.cursor_settle",
+                "lease.release",
+            ]
+        );
+        assert_eq!(reqs[2].params["kinematics"]["duration_ms"], 20);
+        assert_eq!(
+            reqs[5].params,
+            json!({ "ws_id": "ws_01", "expected_epoch": 4 })
+        );
     }
 }

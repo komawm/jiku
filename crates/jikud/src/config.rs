@@ -526,6 +526,9 @@ pub struct KomaTargetConfig {
     pub default_overlay: String,
     /// Maximum Hamming bit delta treated as unchanged screen state (default `4`).
     pub perceptual_hash_threshold: u32,
+    /// Automatic Bezier hover-glide duration in milliseconds before off-target clicks or strokes
+    /// (`0` disables automatic pre-step hover glides; default `140`).
+    pub hover_glide_ms: u64,
     /// Sandbox application profiles allowlist.
     pub allowed_app_profiles: Vec<String>,
 }
@@ -536,6 +539,7 @@ impl Default for KomaTargetConfig {
             default_workspace: "ws_01".to_string(),
             default_overlay: "grid_225".to_string(),
             perceptual_hash_threshold: 4,
+            hover_glide_ms: 140,
             allowed_app_profiles: vec![
                 "chromium-research".to_string(),
                 "libreoffice-headless".to_string(),

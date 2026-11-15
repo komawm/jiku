@@ -757,6 +757,34 @@ impl KomaIpcClient {
             .unwrap_or(expected_epoch))
     }
 
+    /// Smoothly moves the virtual pointer to a single `KomaPathWaypoint` via `vseat.pointer_move`.
+    pub fn pointer_move_waypoint(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        target: &KomaPathWaypoint,
+        profile: &str,
+        duration_ms: u64,
+    ) -> Result<u64, KomaIpcError> {
+        let res = self.call_rpc(
+            "vseat.pointer_move",
+            json!({
+                "ws_id": ws_id,
+                "expected_epoch": expected_epoch,
+                "auto_acquire": true,
+                "target": target.to_json_value(),
+                "kinematics": {
+                    "profile": profile,
+                    "duration_ms": duration_ms,
+                },
+            }),
+        )?;
+        Ok(res
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .unwrap_or(expected_epoch))
+    }
+
     /// Settles (or immediately releases) the virtual agent cursor on `ws_id` via `vseat.cursor_settle`.
     pub fn settle_cursor(&mut self, ws_id: &str, immediate: bool) -> Result<(), KomaIpcError> {
         self.call_rpc(
@@ -767,6 +795,21 @@ impl KomaIpcClient {
             }),
         )?;
         Ok(())
+    }
+
+    /// Releases this session's exclusive control lease on `ws_id` via `lease.release`.
+    pub fn release_lease(&mut self, ws_id: &str, expected_epoch: u64) -> Result<u64, KomaIpcError> {
+        let res = self.call_rpc(
+            "lease.release",
+            json!({
+                "ws_id": ws_id,
+                "expected_epoch": expected_epoch,
+            }),
+        )?;
+        Ok(res
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .unwrap_or(expected_epoch))
     }
 
     #[cfg(test)]
@@ -1463,6 +1506,90 @@ mod tests {
         assert_eq!(
             reqs[3].params,
             json!({ "ws_id": "ws_01", "immediate": true })
+        );
+    }
+
+    #[test]
+    fn pointer_move_waypoint_and_release_lease_send_expected_wire_payloads() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let mut ipc = KomaIpcClient::from_test_stream(client);
+
+        let srv_handle = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut buf = Vec::new();
+            let replies = [
+                json!({ "ok": true, "epoch": 11 }),
+                json!({ "ok": true, "epoch": 12 }),
+                json!({ "epoch": 13 }),
+            ];
+            for result in replies {
+                let req = read_test_rpc_request(&server, &mut buf).unwrap();
+                captured.push(req.clone());
+                let resp = KomaRpcResponse {
+                    id: req.id,
+                    result: Some(result),
+                    error: None,
+                };
+                write_test_rpc_response(&server, &resp, Vec::new()).unwrap();
+            }
+            captured
+        });
+
+        let ep1 = ipc
+            .pointer_move_waypoint(
+                "ws_01",
+                10,
+                &KomaPathWaypoint::Grid225("A1".to_string()),
+                "bezier",
+                140,
+            )
+            .unwrap();
+        assert_eq!(ep1, 11);
+
+        let ep2 = ipc
+            .pointer_move_waypoint(
+                "ws_01",
+                ep1,
+                &KomaPathWaypoint::Xy { x: 420.0, y: 310.0 },
+                "spring",
+                180,
+            )
+            .unwrap();
+        assert_eq!(ep2, 12);
+
+        let ep3 = ipc.release_lease("ws_01", ep2).unwrap();
+        assert_eq!(ep3, 13);
+
+        let reqs = srv_handle.join().unwrap();
+        assert_eq!(reqs[0].method, "vseat.pointer_move");
+        assert_eq!(
+            reqs[0].params,
+            json!({
+                "ws_id": "ws_01",
+                "expected_epoch": 10,
+                "auto_acquire": true,
+                "target": { "grid_225": "A1" },
+                "kinematics": { "profile": "bezier", "duration_ms": 140 }
+            })
+        );
+        assert_eq!(reqs[1].method, "vseat.pointer_move");
+        assert_eq!(
+            reqs[1].params,
+            json!({
+                "ws_id": "ws_01",
+                "expected_epoch": 11,
+                "auto_acquire": true,
+                "target": { "x": 420.0, "y": 310.0 },
+                "kinematics": { "profile": "spring", "duration_ms": 180 }
+            })
+        );
+        assert_eq!(reqs[2].method, "lease.release");
+        assert_eq!(
+            reqs[2].params,
+            json!({
+                "ws_id": "ws_01",
+                "expected_epoch": 12
+            })
         );
     }
 }
