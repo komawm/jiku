@@ -231,6 +231,7 @@ pub enum BenchAction {
     /// Keyboard shortcut chord.
     KeyChord {
         /// Key chord label (e.g. `"Ctrl+z"`).
+        #[serde(default)]
         chord: String,
     },
     /// Explicit semantic modal dismissal action.
@@ -238,6 +239,7 @@ pub enum BenchAction {
     /// Safety abort triggered by the decision/policy safety gate.
     AbortForSafety {
         /// Reason for refusing execution.
+        #[serde(default)]
         reason: String,
     },
 }

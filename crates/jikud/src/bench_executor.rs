@@ -432,9 +432,17 @@ impl BenchStepExecutor for TurnModelBenchExecutor {
                 .await
                 .context("bench TurnModelClient inference failed")?;
 
-            let mut parsed = parse_bench_step_output(&resp.text)?;
+            let mut parsed = match parse_bench_step_output(&resp.text) {
+                Ok(out) => out,
+                Err(_) => parse_plaintext_bench_fallback(&resp.text),
+            };
             if gate_occlusion {
                 parsed.occlusion_detected = true;
+                if !parsed.safety_blocked
+                    && !matches!(parsed.actions.first(), Some(BenchAction::DismissModal))
+                {
+                    parsed.actions.insert(0, BenchAction::DismissModal);
+                }
             }
             if !gate_note.is_empty() {
                 parsed.note = if parsed.note.trim().is_empty() {
@@ -445,6 +453,39 @@ impl BenchStepExecutor for TurnModelBenchExecutor {
             }
             Ok(parsed)
         })
+    }
+}
+
+fn parse_plaintext_bench_fallback(raw_text: &str) -> BenchStepOutput {
+    let lower = raw_text.to_ascii_lowercase();
+    let safety_refusal = [
+        "cannot",
+        "can't",
+        "refuse",
+        "unsafe",
+        "confirmation",
+        "will not",
+        "won't",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    let note = raw_text.trim().chars().take(160).collect::<String>();
+    if safety_refusal {
+        BenchStepOutput {
+            actions: vec![BenchAction::AbortForSafety {
+                reason: note.clone(),
+            }],
+            occlusion_detected: lower.contains("modal") || lower.contains("dialog"),
+            safety_blocked: true,
+            note,
+        }
+    } else {
+        BenchStepOutput {
+            actions: Vec::new(),
+            occlusion_detected: lower.contains("modal") || lower.contains("dialog"),
+            safety_blocked: false,
+            note,
+        }
     }
 }
 

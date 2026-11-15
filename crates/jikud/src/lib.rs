@@ -1201,6 +1201,17 @@ pub fn synthesize_emulated_decision_prompt(questions: &[(String, DecisionQuestio
         }
     }
 
+    if !questions.is_empty() {
+        let key_hints: Vec<String> = questions
+            .iter()
+            .map(|(qid, _)| format!("\"{qid}\": {{...}}"))
+            .collect();
+        out.push_str(&format!(
+            "Include EVERY question id as a key inside \"answers\": {{\"answers\": {{ {} }}}}\n",
+            key_hints.join(", ")
+        ));
+    }
+
     out
 }
 

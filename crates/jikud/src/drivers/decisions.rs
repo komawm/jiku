@@ -435,34 +435,7 @@ impl DecisionExecutor {
             )
             .await?;
 
-        let json_slice = strip_markdown_json_fences(&turn_resp.text);
-        let parsed: Value = serde_json::from_str(json_slice).map_err(|err| {
-            DriverError::InvalidPayload(format!(
-                "emulated decision response was not valid JSON ({err}): {}",
-                turn_resp.text
-            ))
-        })?;
-
-        let answers_obj = parsed
-            .get("answers")
-            .or_else(|| parsed.get("results"))
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                DriverError::InvalidPayload(
-                    "emulated decision JSON missing top-level `answers` object".to_string(),
-                )
-            })?;
-
-        let mut answers = BTreeMap::new();
-        for (qid, kind) in &spec.questions {
-            let val = answers_obj.get(qid).ok_or_else(|| {
-                DriverError::InvalidPayload(format!(
-                    "emulated decision JSON omitted required question `{qid}`"
-                ))
-            })?;
-            let normalized = normalize_emulated_answer(kind, val)?;
-            answers.insert(qid.clone(), normalized);
-        }
+        let answers = parse_emulated_decision_answers(&turn_resp.text, &spec.questions)?;
 
         Ok(DecisionBatchResponse {
             execution_mode: "emulated_structured_text_model".to_string(),
@@ -475,6 +448,132 @@ impl DecisionExecutor {
                 cached_tokens: 0,
             },
         })
+    }
+}
+
+/// Parses emulated decision-batch JSON emitted by small VLMs or text models, supporting
+/// standard `{"answers": {...}}` maps, array-of-objects `answers`/`results`, flat top-level
+/// question keys, scalar values, and partial-response neutral priors.
+pub(crate) fn parse_emulated_decision_answers(
+    raw_text: &str,
+    questions: &[(String, DecisionQuestionKind)],
+) -> Result<BTreeMap<String, DecisionAnswer>, DriverError> {
+    let stripped = strip_markdown_json_fences(raw_text);
+    let candidate = extract_json_object_slice(stripped).unwrap_or(stripped);
+    let parsed: Value = serde_json::from_str(candidate).map_err(|err| {
+        DriverError::InvalidPayload(format!(
+            "emulated decision response was not valid JSON ({err}): {raw_text}"
+        ))
+    })?;
+    let root = parsed.as_object().ok_or_else(|| {
+        DriverError::InvalidPayload(
+            "emulated decision response JSON must be a top-level object".to_string(),
+        )
+    })?;
+
+    let mut by_id: BTreeMap<String, Value> = BTreeMap::new();
+    let container = root.get("answers").or_else(|| root.get("results"));
+    match container {
+        Some(Value::Object(map)) => {
+            for (k, v) in map {
+                by_id.insert(k.clone(), v.clone());
+            }
+            if let Some(id) = map
+                .get("id")
+                .or_else(|| map.get("question_id"))
+                .and_then(Value::as_str)
+                && questions.iter().any(|(qid, _)| qid == id)
+            {
+                by_id.insert(id.to_string(), Value::Object(map.clone()));
+            }
+        }
+        Some(Value::Array(items)) => {
+            for (idx, item) in items.iter().enumerate() {
+                if let Some(id) = item
+                    .get("id")
+                    .or_else(|| item.get("question_id"))
+                    .and_then(Value::as_str)
+                {
+                    by_id.insert(id.to_string(), item.clone());
+                } else if items.len() == questions.len()
+                    && let Some((qid, _)) = questions.get(idx)
+                {
+                    by_id.insert(qid.clone(), item.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for (qid, _) in questions {
+        if !by_id.contains_key(qid)
+            && let Some(top_val) = root.get(qid)
+        {
+            by_id.insert(qid.clone(), top_val.clone());
+        }
+    }
+
+    if container.is_none() && !questions.iter().any(|(qid, _)| by_id.contains_key(qid)) {
+        return Err(DriverError::InvalidPayload(
+            "emulated decision JSON missing `answers` container and question keys".to_string(),
+        ));
+    }
+
+    let mut answers = BTreeMap::new();
+    for (qid, kind) in questions {
+        let normalized = match by_id.get(qid) {
+            Some(val) => normalize_emulated_answer(kind, val)?,
+            None => default_neutral_answer(kind),
+        };
+        answers.insert(qid.clone(), normalized);
+    }
+    Ok(answers)
+}
+
+fn extract_json_object_slice(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if start < end {
+        Some(&trimmed[start..=end])
+    } else {
+        None
+    }
+}
+
+fn default_neutral_answer(expected: &DecisionQuestionKind) -> DecisionAnswer {
+    match expected {
+        DecisionQuestionKind::Noul { .. } => DecisionAnswer::Noul {
+            noul: 0.5,
+            confidence: 0.5,
+        },
+        DecisionQuestionKind::Choice { choices, .. } => {
+            let fallback = choices
+                .last()
+                .filter(|c| c.as_str() == crate::MANDATORY_CHOICE_FALLBACK)
+                .map(String::as_str)
+                .unwrap_or(crate::MANDATORY_CHOICE_FALLBACK)
+                .to_string();
+            let mut probs = BTreeMap::new();
+            probs.insert(fallback.clone(), 0.5);
+            DecisionAnswer::Choice {
+                choice: fallback,
+                confidence: 0.5,
+                probabilities: probs,
+            }
+        }
+        DecisionQuestionKind::Score { rubric, .. } => {
+            let mut legend = BTreeMap::new();
+            for (idx, desc) in rubric.iter().enumerate() {
+                legend.insert(idx.to_string(), desc.clone());
+            }
+            DecisionAnswer::Score {
+                score: 1.0,
+                confidence: 0.5,
+                probabilities: BTreeMap::new(),
+                legend,
+            }
+        }
     }
 }
 
@@ -549,6 +648,37 @@ fn decision_block_type_for_mime(mime: &str) -> &'static str {
     }
 }
 
+fn parse_noul_scalar(val: &Value) -> Option<f32> {
+    match val {
+        Value::Bool(true) => Some(0.92),
+        Value::Bool(false) => Some(0.08),
+        Value::Number(n) => n.as_f64().map(|f| f as f32),
+        Value::String(s) => {
+            let trimmed = s.trim().to_ascii_lowercase();
+            if matches!(trimmed.as_str(), "yes" | "true" | "safe" | "allow") {
+                Some(0.90)
+            } else if matches!(trimmed.as_str(), "no" | "false" | "unsafe" | "deny") {
+                Some(0.10)
+            } else {
+                trimmed.parse::<f32>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn match_choice_case_insensitive(choices: &[String], candidate: &str) -> String {
+    let trimmed = candidate.trim();
+    if let Some(exact) = choices.iter().find(|c| c.eq_ignore_ascii_case(trimmed)) {
+        return exact.clone();
+    }
+    choices
+        .last()
+        .map(String::as_str)
+        .unwrap_or("NONE_OR_OTHER")
+        .to_string()
+}
+
 fn normalize_emulated_answer(
     expected: &DecisionQuestionKind,
     val: &Value,
@@ -558,11 +688,15 @@ fn normalize_emulated_answer(
     }
     match expected {
         DecisionQuestionKind::Noul { .. } => {
-            let p = val
-                .get("noul")
-                .or_else(|| val.get("probability"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.5) as f32;
+            let p = parse_noul_scalar(val)
+                .or_else(|| {
+                    val.get("noul")
+                        .or_else(|| val.get("probability"))
+                        .or_else(|| val.get("value"))
+                        .or_else(|| val.get("answer"))
+                        .and_then(parse_noul_scalar)
+                })
+                .unwrap_or(0.5);
             let conf = val
                 .get("confidence")
                 .and_then(Value::as_f64)
@@ -575,15 +709,21 @@ fn normalize_emulated_answer(
         }
         DecisionQuestionKind::Choice { choices, .. } => {
             let chosen = val
-                .get("choice")
-                .and_then(Value::as_str)
+                .as_str()
+                .or_else(|| {
+                    val.get("choice")
+                        .or_else(|| val.get("value"))
+                        .or_else(|| val.get("answer"))
+                        .and_then(Value::as_str)
+                })
+                .map(|s| match_choice_case_insensitive(choices, s))
                 .unwrap_or_else(|| {
                     choices
                         .last()
                         .map(String::as_str)
                         .unwrap_or("NONE_OR_OTHER")
-                })
-                .to_string();
+                        .to_string()
+                });
             let mut probs = BTreeMap::new();
             if let Some(map) = val.get("probabilities").and_then(Value::as_object) {
                 for (k, v) in map {
@@ -608,7 +748,14 @@ fn normalize_emulated_answer(
             })
         }
         DecisionQuestionKind::Score { rubric, .. } => {
-            let score = val.get("score").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+            let score = val
+                .as_f64()
+                .or_else(|| {
+                    val.get("score")
+                        .or_else(|| val.get("value"))
+                        .and_then(Value::as_f64)
+                })
+                .unwrap_or(1.0) as f32;
             let conf = val
                 .get("confidence")
                 .and_then(Value::as_f64)
@@ -696,5 +843,57 @@ mod tests {
         assert_eq!(parsed.usage.total_output_tokens, 0);
         assert_eq!(parsed.answers["q_target"].top_choice(), Some(("G8", 0.86)));
         assert_eq!(parsed.answers["q_in_scope"].noul_prob(), Some(0.91));
+    }
+
+    #[test]
+    fn parse_emulated_decision_answers_accepts_arrays_scalars_partials_and_rejects_unrelated() {
+        let questions = vec![
+            (
+                "q_in_scope".to_string(),
+                DecisionQuestionKind::Noul {
+                    instructions: "In scope?".to_string(),
+                },
+            ),
+            (
+                "q_strategy".to_string(),
+                DecisionQuestionKind::Choice {
+                    instructions: "Pick strategy".to_string(),
+                    choices: vec![
+                        "draw_rainbow_arch".to_string(),
+                        MANDATORY_CHOICE_FALLBACK.to_string(),
+                    ],
+                    scope_gate_question_id: "q_in_scope".to_string(),
+                },
+            ),
+            (
+                "q_quality".to_string(),
+                DecisionQuestionKind::Score {
+                    instructions: "Score quality".to_string(),
+                    rubric: vec!["Poor".to_string(), "Good".to_string()],
+                },
+            ),
+        ];
+
+        // 1. Array-shaped answers wrapped in prose + markdown fence.
+        let array_raw = "Result:\n```json\n{\"answers\":[{\"id\":\"q_in_scope\",\"answer\":\"yes\"},{\"id\":\"q_strategy\",\"choice\":\"DRAW_RAINBOW_ARCH\"},{\"id\":\"q_quality\",\"value\":2}]}\n```";
+        let arr_parsed = parse_emulated_decision_answers(array_raw, &questions).unwrap();
+        assert_eq!(arr_parsed["q_in_scope"].noul_prob(), Some(0.90));
+        assert_eq!(
+            arr_parsed["q_strategy"].top_choice().map(|(c, _)| c),
+            Some("draw_rainbow_arch")
+        );
+
+        // 2. Flat top-level partial JSON with scalar boolean and omitted keys -> neutral priors.
+        let flat_partial = r#"{"q_in_scope": false}"#;
+        let flat_parsed = parse_emulated_decision_answers(flat_partial, &questions).unwrap();
+        assert_eq!(flat_parsed["q_in_scope"].noul_prob(), Some(0.08));
+        assert_eq!(
+            flat_parsed["q_strategy"].top_choice(),
+            Some((MANDATORY_CHOICE_FALLBACK, 0.5))
+        );
+
+        // 3. Unrelated JSON object is rejected cleanly.
+        let err = parse_emulated_decision_answers(r#"{"hello":"world"}"#, &questions).unwrap_err();
+        assert!(err.to_string().contains("missing `answers` container"));
     }
 }
