@@ -125,6 +125,18 @@ pub struct KomaWindowSummary {
     pub is_floating: bool,
     /// Sandbox profile flag.
     pub is_sandboxed: bool,
+    /// Logical window X coordinate when reported by `scene.inventory`.
+    #[serde(default)]
+    pub rect_x: Option<i32>,
+    /// Logical window Y coordinate when reported by `scene.inventory`.
+    #[serde(default)]
+    pub rect_y: Option<i32>,
+    /// Logical window width when reported by `scene.inventory`.
+    #[serde(default)]
+    pub rect_w: Option<u32>,
+    /// Logical window height when reported by `scene.inventory`.
+    #[serde(default)]
+    pub rect_h: Option<u32>,
 }
 
 /// Workspace snapshot entry returned by `scene.inventory`.
@@ -312,34 +324,50 @@ impl KomaIpcClient {
                 .and_then(Value::as_u64)
                 .unwrap_or(800) as u32;
 
-            let active_window =
-                ws.get("active_window")
-                    .filter(|v| !v.is_null())
-                    .map(|w| KomaWindowSummary {
-                        win_id: w
-                            .get("win_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        app_id: w
-                            .get("app_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        title: w
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        is_floating: w
-                            .get("is_floating")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        is_sandboxed: w
-                            .get("is_sandboxed")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    });
+            let active_window = ws.get("active_window").filter(|v| !v.is_null()).map(|w| {
+                let rect = w.get("rect");
+                KomaWindowSummary {
+                    win_id: w
+                        .get("win_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    app_id: w
+                        .get("app_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    title: w
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    is_floating: w
+                        .get("is_floating")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    is_sandboxed: w
+                        .get("is_sandboxed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    rect_x: rect
+                        .and_then(|r| r.get("x"))
+                        .and_then(Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok()),
+                    rect_y: rect
+                        .and_then(|r| r.get("y"))
+                        .and_then(Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok()),
+                    rect_w: rect
+                        .and_then(|r| r.get("w"))
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok()),
+                    rect_h: rect
+                        .and_then(|r| r.get("h"))
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok()),
+                }
+            });
 
             out.push(KomaWorkspaceSummary {
                 ws_id,
@@ -463,6 +491,85 @@ impl KomaIpcClient {
                 "y": y,
                 "button": button,
                 "clicks": clicks,
+            }),
+        )?;
+        Ok(res
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .unwrap_or(expected_epoch))
+    }
+
+    /// Drags the virtual pointer between two window-local logical coordinates via `vseat.drag`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drag_xy(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        from_x: f64,
+        from_y: f64,
+        to_x: f64,
+        to_y: f64,
+        button: &str,
+        profile: &str,
+        duration_ms: u64,
+    ) -> Result<u64, KomaIpcError> {
+        self.drag_anchors(
+            ws_id,
+            expected_epoch,
+            json!({ "x": from_x, "y": from_y }),
+            json!({ "x": to_x, "y": to_y }),
+            button,
+            profile,
+            duration_ms,
+        )
+    }
+
+    /// Drags the virtual pointer between two 15x15 `grid_225` cells via `vseat.drag`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drag_grid(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        from_cell: &str,
+        to_cell: &str,
+        button: &str,
+        profile: &str,
+        duration_ms: u64,
+    ) -> Result<u64, KomaIpcError> {
+        self.drag_anchors(
+            ws_id,
+            expected_epoch,
+            json!({ "grid_225": from_cell }),
+            json!({ "grid_225": to_cell }),
+            button,
+            profile,
+            duration_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drag_anchors(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        from: Value,
+        to: Value,
+        button: &str,
+        profile: &str,
+        duration_ms: u64,
+    ) -> Result<u64, KomaIpcError> {
+        let res = self.call_rpc(
+            "vseat.drag",
+            json!({
+                "ws_id": ws_id,
+                "expected_epoch": expected_epoch,
+                "from": from,
+                "to": to,
+                "button": button,
+                "kinematics": {
+                    "profile": profile,
+                    "duration_ms": duration_ms,
+                },
             }),
         )?;
         Ok(res
@@ -877,5 +984,65 @@ mod tests {
         assert_ne!(dhash, 0);
         assert_eq!(sniff_png_dimensions(&png), Some((4, 4)));
         srv_handle.join().unwrap();
+    }
+
+    #[test]
+    fn drag_xy_and_drag_grid_send_expected_vseat_drag_payloads() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let mut ipc = KomaIpcClient {
+            stream: client,
+            next_id: 10,
+            instance_dir: PathBuf::new(),
+            session_id: "sess_test".to_string(),
+        };
+
+        let srv_handle = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            for expected_epoch in [5_u64, 6_u64] {
+                let mut req_buf = [0_u8; 2048];
+                let (n, _) = recv_with_fds(&server, &mut req_buf).unwrap();
+                let req: KomaRpcRequest = serde_json::from_slice(&req_buf[4..n]).unwrap();
+                captured.push(req.clone());
+                let resp = KomaRpcResponse {
+                    id: req.id,
+                    result: Some(json!({ "ok": true, "epoch": expected_epoch + 1 })),
+                    error: None,
+                };
+                let body = serde_json::to_vec(&resp).unwrap();
+                let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+                frame.extend_from_slice(&body);
+                send_with_fds(&server, &frame, &[]).unwrap();
+            }
+            captured
+        });
+
+        let epoch1 = ipc
+            .drag_xy(
+                "ws_01", 5, 100.0, 200.0, 350.0, 420.0, "left", "spring", 150,
+            )
+            .unwrap();
+        let epoch2 = ipc
+            .drag_grid("ws_01", epoch1, "C4", "M8", "left", "bezier", 120)
+            .unwrap();
+        assert_eq!(epoch1, 6);
+        assert_eq!(epoch2, 7);
+
+        let reqs = srv_handle.join().unwrap();
+        assert_eq!(reqs[0].method, "vseat.drag");
+        assert_eq!(reqs[0].params["from"], json!({ "x": 100.0, "y": 200.0 }));
+        assert_eq!(reqs[0].params["to"], json!({ "x": 350.0, "y": 420.0 }));
+        assert_eq!(reqs[0].params["button"], "left");
+        assert_eq!(
+            reqs[0].params["kinematics"],
+            json!({ "profile": "spring", "duration_ms": 150 })
+        );
+
+        assert_eq!(reqs[1].method, "vseat.drag");
+        assert_eq!(reqs[1].params["from"], json!({ "grid_225": "C4" }));
+        assert_eq!(reqs[1].params["to"], json!({ "grid_225": "M8" }));
+        assert_eq!(
+            reqs[1].params["kinematics"],
+            json!({ "profile": "bezier", "duration_ms": 120 })
+        );
     }
 }

@@ -46,7 +46,7 @@ use crate::{
 };
 
 const MAX_DAEMON_FRAME_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TASK_ACTIONS: usize = 8;
+const MAX_TASK_ACTIONS: usize = 48;
 
 /// Serializable decision question DTO accepted over `jiku.sock` and CLI/MCP surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +183,42 @@ pub enum PlannedKomaStep {
         #[serde(default = "default_clicks")]
         clicks: u8,
     },
+    /// Drag the pointer linearly or along a kinematic profile between two local `(x, y)` coordinates.
+    DragXy {
+        /// Stroke starting horizontal coordinate.
+        from_x: f64,
+        /// Stroke starting vertical coordinate.
+        from_y: f64,
+        /// Stroke ending horizontal coordinate.
+        to_x: f64,
+        /// Stroke ending vertical coordinate.
+        to_y: f64,
+        /// Mouse button (`"left"`, `"right"`, `"middle"`).
+        #[serde(default = "default_mouse_button")]
+        button: String,
+        /// Trajectory profile (`"spring"`, `"minimum_jerk"`, `"bezier"`, `"instant"`).
+        #[serde(default = "default_drag_profile")]
+        profile: String,
+        /// Requested trajectory duration in milliseconds.
+        #[serde(default = "default_drag_duration_ms")]
+        duration_ms: u64,
+    },
+    /// Drag the pointer between two 15x15 `grid_225` cells.
+    DragCell {
+        /// Starting cell label (`"A1"`..=`"O15"`).
+        from_cell: String,
+        /// Ending cell label (`"A1"`..=`"O15"`).
+        to_cell: String,
+        /// Mouse button (`"left"`, `"right"`, `"middle"`).
+        #[serde(default = "default_mouse_button")]
+        button: String,
+        /// Trajectory profile (`"spring"`, `"minimum_jerk"`, `"bezier"`, `"instant"`).
+        #[serde(default = "default_drag_profile")]
+        profile: String,
+        /// Requested trajectory duration in milliseconds.
+        #[serde(default = "default_drag_duration_ms")]
+        duration_ms: u64,
+    },
     /// Inject UTF-8 text into the focused Wayland client via `vseat.inject_text`.
     InjectText {
         /// Text string to commit via `zwp_text_input_v3` / clipboard fallback.
@@ -193,6 +229,11 @@ pub enum PlannedKomaStep {
         /// Chord descriptor understood by Koma.
         chord: String,
     },
+    /// Wait `ms` milliseconds for animations or client repaints to settle.
+    WaitMs {
+        /// Delay duration in milliseconds (clamped at execution time to 5000 ms).
+        ms: u64,
+    },
 }
 
 fn default_mouse_button() -> String {
@@ -201,6 +242,23 @@ fn default_mouse_button() -> String {
 
 const fn default_clicks() -> u8 {
     1
+}
+
+fn default_drag_profile() -> String {
+    "spring".to_string()
+}
+
+const fn default_drag_duration_ms() -> u64 {
+    120
+}
+
+fn normalize_kinematic_profile(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "instant" => "instant",
+        "minimum_jerk" | "minimum-jerk" | "min_jerk" => "minimum_jerk",
+        "bezier" => "bezier",
+        _ => "spring",
+    }
 }
 
 /// Execution outcome of a single planned step in [`RunTaskReport`].
@@ -616,7 +674,7 @@ impl JikuEngine {
             (
                 "q_safety_risk".to_string(),
                 DecisionQuestionKind::Noul {
-                    instructions: "Only answer Yes if the goal deletes system/user files recursively, exfiltrates passwords/API keys, executes financial transfers, or asks to bypass a lock/security prompt. Benign terminal commands, test output, or UI clicks MUST be answered No.".to_string(),
+                    instructions: "Only answer Yes if the goal deletes system/user files recursively, exfiltrates passwords/API keys, executes financial transfers, or asks to bypass a lock/security prompt. Benign terminal commands, test output, drawing/painting strokes, or UI clicks MUST be answered No.".to_string(),
                 },
             ),
             (
@@ -626,6 +684,7 @@ impl JikuEngine {
                     choices: vec![
                         "type_or_key".to_string(),
                         "click_target".to_string(),
+                        "drag_or_draw".to_string(),
                         "multi_step_plan".to_string(),
                         MANDATORY_CHOICE_FALLBACK.to_string(),
                     ],
@@ -793,7 +852,7 @@ impl JikuEngine {
                         media: media_vec,
                     }],
                     temperature: Some(0.1),
-                    max_tokens: Some(1200),
+                    max_tokens: Some(4096),
                     json_object: true,
                     stream: false,
                     thinking_enabled,
@@ -837,7 +896,10 @@ impl JikuEngine {
                     &self.config.koma.default_overlay,
                 );
                 match outcome {
-                    Ok(()) => {
+                    Ok(settle_delay) => {
+                        if !settle_delay.is_zero() {
+                            tokio::time::sleep(settle_delay).await;
+                        }
                         executed_steps.push(ExecutedStepReport {
                             step,
                             status: "ok".to_string(),
@@ -1271,9 +1333,13 @@ fn execute_step_with_epoch_retry(
     current_epoch: &mut u64,
     step: &PlannedKomaStep,
     default_overlay: &str,
-) -> Result<(), StepHalt> {
+) -> Result<Duration, StepHalt> {
+    if let PlannedKomaStep::WaitMs { ms } = step {
+        return Ok(Duration::from_millis((*ms).min(5_000)));
+    }
+
     for attempt in 0..=1 {
-        let res = match step {
+        let (res, settle_delay) = match step {
             PlannedKomaStep::ClickCell {
                 cell,
                 button,
@@ -1285,22 +1351,95 @@ fn execute_step_with_epoch_retry(
                         "planner produced invalid grid_225 cell label `{cell}`"
                     )));
                 }
-                ipc.click_grid(ws_id, *current_epoch, &normalized, button, (*clicks).max(1))
+                (
+                    ipc.click_grid(ws_id, *current_epoch, &normalized, button, (*clicks).max(1)),
+                    Duration::from_millis(35),
+                )
             }
             PlannedKomaStep::ClickXy {
                 x,
                 y,
                 button,
                 clicks,
-            } => ipc.click_xy(ws_id, *current_epoch, *x, *y, button, (*clicks).max(1)),
-            PlannedKomaStep::InjectText { text } => ipc.inject_text(ws_id, *current_epoch, text),
-            PlannedKomaStep::Key { chord } => ipc.tap_key(ws_id, *current_epoch, chord),
+            } => (
+                ipc.click_xy(ws_id, *current_epoch, *x, *y, button, (*clicks).max(1)),
+                Duration::from_millis(35),
+            ),
+            PlannedKomaStep::DragXy {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+                profile,
+                duration_ms,
+            } => {
+                let norm_profile = normalize_kinematic_profile(profile);
+                let dur = (*duration_ms).min(5_000);
+                (
+                    ipc.drag_xy(
+                        ws_id,
+                        *current_epoch,
+                        *from_x,
+                        *from_y,
+                        *to_x,
+                        *to_y,
+                        button,
+                        norm_profile,
+                        dur,
+                    ),
+                    drag_settle_delay(norm_profile, dur),
+                )
+            }
+            PlannedKomaStep::DragCell {
+                from_cell,
+                to_cell,
+                button,
+                profile,
+                duration_ms,
+            } => {
+                let norm_from = from_cell.trim().to_ascii_uppercase();
+                if GridSpec::default().parse_cell_label(&norm_from).is_none() {
+                    return Err(StepHalt::Fatal(anyhow!(
+                        "planner produced invalid grid_225 cell label `{from_cell}`"
+                    )));
+                }
+                let norm_to = to_cell.trim().to_ascii_uppercase();
+                if GridSpec::default().parse_cell_label(&norm_to).is_none() {
+                    return Err(StepHalt::Fatal(anyhow!(
+                        "planner produced invalid grid_225 cell label `{to_cell}`"
+                    )));
+                }
+                let norm_profile = normalize_kinematic_profile(profile);
+                let dur = (*duration_ms).min(5_000);
+                (
+                    ipc.drag_grid(
+                        ws_id,
+                        *current_epoch,
+                        &norm_from,
+                        &norm_to,
+                        button,
+                        norm_profile,
+                        dur,
+                    ),
+                    drag_settle_delay(norm_profile, dur),
+                )
+            }
+            PlannedKomaStep::InjectText { text } => (
+                ipc.inject_text(ws_id, *current_epoch, text),
+                Duration::from_millis(20),
+            ),
+            PlannedKomaStep::Key { chord } => (
+                ipc.tap_key(ws_id, *current_epoch, chord),
+                Duration::from_millis(20),
+            ),
+            PlannedKomaStep::WaitMs { .. } => unreachable!("handled prior to RPC retry loop"),
         };
 
         match res {
             Ok(new_epoch) => {
                 *current_epoch = new_epoch;
-                return Ok(());
+                return Ok(settle_delay);
             }
             Err(KomaIpcError::Rpc(err)) if err.code == ERR_CODE_HUMAN_PREEMPTED => {
                 return Err(StepHalt::HumanPreempted);
@@ -1641,6 +1780,14 @@ fn detect_image_mime(path: &Path, bytes: &[u8]) -> &'static str {
     }
 }
 
+fn drag_settle_delay(profile: &str, duration_ms: u64) -> Duration {
+    match profile {
+        "instant" => Duration::from_millis(25),
+        "spring" => Duration::from_millis(duration_ms.max(260) + 60),
+        _ => Duration::from_millis(duration_ms + 50),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_runtime_context_summary(
     ws_id: &str,
@@ -1670,6 +1817,12 @@ fn build_runtime_context_summary(
             "Viewport: {}x{}, layout={}",
             ws.viewport_width, ws.viewport_height, ws.layout_mode
         ));
+        if let Some(win) = &ws.active_window
+            && let (Some(x), Some(y), Some(w), Some(h)) =
+                (win.rect_x, win.rect_y, win.rect_w, win.rect_h)
+        {
+            lines.push(format!("Active window geometry: {w}x{h} at ({x}, {y})"));
+        }
     }
     if !injected_notes.is_empty() {
         lines.push("Prefetch notes:".to_string());
@@ -1689,16 +1842,21 @@ fn build_planner_system_prompt() -> String {
         "  \"steps\": [\n",
         "    {\"action\": \"click_cell\", \"cell\": \"H8\", \"button\": \"left\", \"clicks\": 1},\n",
         "    {\"action\": \"click_xy\", \"x\": 640, \"y\": 400, \"button\": \"left\", \"clicks\": 1},\n",
+        "    {\"action\": \"drag_xy\", \"from_x\": 180, \"from_y\": 260, \"to_x\": 520, \"to_y\": 260, \"button\": \"left\", \"profile\": \"spring\", \"duration_ms\": 140},\n",
+        "    {\"action\": \"drag_cell\", \"from_cell\": \"C4\", \"to_cell\": \"M4\", \"button\": \"left\", \"profile\": \"bezier\", \"duration_ms\": 120},\n",
         "    {\"action\": \"inject_text\", \"text\": \"command without trailing newline\"},\n",
-        "    {\"action\": \"key\", \"chord\": \"Return\"}\n",
+        "    {\"action\": \"key\", \"chord\": \"Return\"},\n",
+        "    {\"action\": \"wait_ms\", \"ms\": 150}\n",
         "  ],\n",
         "  \"candidate_skill\": null\n",
         "}\n",
         "Rules:\n",
-        "- Only use action values: \"click_cell\", \"click_xy\", \"inject_text\", \"key\".\n",
-        "- Grid overlay cells use 15x15 labels A1..O15.\n",
+        "- Only use action values: \"click_cell\", \"click_xy\", \"drag_xy\", \"drag_cell\", \"inject_text\", \"key\", \"wait_ms\".\n",
+        "- Grid overlay cells use 15x15 labels A1..O15 (columns A..O left-to-right, rows 1..15 top-to-bottom).\n",
+        "- When `Active window geometry: WxH at (X, Y)` is present, `click_xy` and `drag_xy` coordinates are local to that active window (`0..W`, `0..H`).\n",
+        "- For `drag_xy` / `drag_cell`, `profile` may be \"spring\" (damped Hooke spring dynamics), \"bezier\", \"minimum_jerk\", or \"instant\".\n",
         "- When the active window is already a terminal (such as foot) and you want to run a command, click the terminal center if unfocused or directly emit inject_text (without newline) followed by {\"action\": \"key\", \"chord\": \"Return\"}.\n",
-        "- Keep steps <= 8 and preserve exact text requested by the user."
+        "- Keep steps <= 48 and preserve exact text requested by the user."
     )
     .to_string()
 }
@@ -1863,5 +2021,81 @@ mod tests {
             )
             .await
             .expect("examples/init.lua episode.completed handler must accept duration_ms");
+    }
+
+    #[test]
+    fn planned_koma_step_drag_and_wait_serde_defaults_and_settle_delays() {
+        let raw = json!([
+            {
+                "action": "drag_xy",
+                "from_x": 120.0,
+                "from_y": 240.0,
+                "to_x": 420.0,
+                "to_y": 300.0
+            },
+            {
+                "action": "drag_cell",
+                "from_cell": "C4",
+                "to_cell": "M9",
+                "profile": "bezier",
+                "duration_ms": 180
+            },
+            {
+                "action": "wait_ms",
+                "ms": 250
+            }
+        ]);
+        let steps: Vec<PlannedKomaStep> = serde_json::from_value(raw).unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(
+            steps[0],
+            PlannedKomaStep::DragXy {
+                from_x: 120.0,
+                from_y: 240.0,
+                to_x: 420.0,
+                to_y: 300.0,
+                button: "left".to_string(),
+                profile: "spring".to_string(),
+                duration_ms: 120,
+            }
+        );
+        assert_eq!(drag_settle_delay("spring", 120), Duration::from_millis(320));
+        assert_eq!(drag_settle_delay("bezier", 180), Duration::from_millis(230));
+        assert_eq!(drag_settle_delay("instant", 180), Duration::from_millis(25));
+        assert_eq!(normalize_kinematic_profile("Hooke"), "spring");
+        assert_eq!(MAX_TASK_ACTIONS, 48);
+
+        let inv = vec![KomaWorkspaceSummary {
+            ws_id: "ws_01".to_string(),
+            name: "main".to_string(),
+            layout_mode: "dwindle".to_string(),
+            epoch: 3,
+            is_human_preempted: false,
+            viewport_width: 1280,
+            viewport_height: 800,
+            active_window: Some(crate::koma_ipc::KomaWindowSummary {
+                win_id: "win_1_g1".to_string(),
+                app_id: "koma-paint-probe".to_string(),
+                title: "Koma Paint".to_string(),
+                is_floating: false,
+                is_sandboxed: false,
+                rect_x: Some(12),
+                rect_y: Some(12),
+                rect_w: Some(1256),
+                rect_h: Some(776),
+            }),
+        }];
+        let ctx = build_runtime_context_summary(
+            "ws_01",
+            "Paint a sunlit house",
+            &inv,
+            "koma-paint-probe",
+            "Koma Paint",
+            "win_1_g1",
+            Some(3),
+            false,
+            &[],
+        );
+        assert!(ctx.contains("Active window geometry: 1256x776 at (12, 12)"));
     }
 }
