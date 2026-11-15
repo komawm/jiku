@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Executable entrypoint for the `jikud` desktop orchestration daemon.
 
 use std::{env, path::PathBuf, process};

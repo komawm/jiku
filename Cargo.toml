@@ -31,7 +31,7 @@ futures-util = "0.3"
 png = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
-rustix = { version = "1.1.6", features = ["fs", "mm", "net", "process"] }
+rustix = { version = "1.1.6", features = ["fs", "net", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
@@ -42,4 +42,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [workspace.lints.rust]
+unsafe_code = "forbid"
 unused_must_use = "deny"

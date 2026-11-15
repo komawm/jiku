@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Command controller, daemon client, and MCP server (`jiku`) for `jikud`.
 
 pub mod client;

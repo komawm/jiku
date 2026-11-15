@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! CLI controller and MCP bridge binary (`jiku`) for `jikud`.
 
 use std::{

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Optional speech synthesis providers, lip-sync envelope extractors, and
 //! D-Bus desktop notification helpers for Jiku.
 //!
