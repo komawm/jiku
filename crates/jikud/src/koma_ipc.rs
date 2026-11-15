@@ -187,6 +187,8 @@ pub struct KomaIpcClient {
     next_id: u64,
     instance_dir: PathBuf,
     session_id: String,
+    read_buf: Vec<u8>,
+    pending_fds: VecDeque<OwnedFd>,
 }
 
 impl KomaIpcClient {
@@ -250,6 +252,8 @@ impl KomaIpcClient {
             next_id: 2,
             instance_dir: instance_dir.to_path_buf(),
             session_id,
+            read_buf: Vec::new(),
+            pending_fds: VecDeque::new(),
         })
     }
 
@@ -271,6 +275,30 @@ impl KomaIpcClient {
         id
     }
 
+    fn roundtrip_rpc(
+        &mut self,
+        req: &KomaRpcRequest,
+        req_fds: Vec<OwnedFd>,
+    ) -> io::Result<(KomaRpcResponse, Vec<OwnedFd>)> {
+        let payload = serde_json::to_vec(req)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        send_frame_with_fds(&self.stream, &payload, req_fds)?;
+        loop {
+            let body =
+                read_next_raw_frame(&self.stream, &mut self.read_buf, &mut self.pending_fds)?;
+            let raw_val: Value = serde_json::from_slice(&body)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            // Skip unsolicited Koma workspace EventEnvelope notifications (no matching request `id`).
+            if raw_val.get("id").and_then(Value::as_u64) != Some(req.id) {
+                continue;
+            }
+            let parsed: KomaRpcResponse = serde_json::from_value(raw_val)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let fds: Vec<OwnedFd> = self.pending_fds.drain(..).collect();
+            return Ok((parsed, fds));
+        }
+    }
+
     /// Sends a generic JSON RPC over `koma-agent.sock` and returns the result JSON value.
     pub fn call_rpc(&mut self, method: &str, params: Value) -> Result<Value, KomaIpcError> {
         let req = KomaRpcRequest {
@@ -278,7 +306,7 @@ impl KomaIpcClient {
             method: method.to_string(),
             params,
         };
-        let (resp, _): (KomaRpcResponse, _) = sync_roundtrip(&self.stream, &req, Vec::new())?;
+        let (resp, _): (KomaRpcResponse, _) = self.roundtrip_rpc(&req, Vec::new())?;
         if let Some(err) = resp.error {
             return Err(KomaIpcError::Rpc(err));
         }
@@ -404,7 +432,7 @@ impl KomaIpcClient {
                 "transport": "shm_fd",
             }),
         };
-        let (resp, mut fds): (KomaRpcResponse, _) = sync_roundtrip(&self.stream, &req, Vec::new())?;
+        let (resp, mut fds): (KomaRpcResponse, _) = self.roundtrip_rpc(&req, Vec::new())?;
         if let Some(err) = resp.error {
             return Err(KomaIpcError::Rpc(err));
         }
@@ -780,13 +808,11 @@ fn downscale_rgba8(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -
 
 /// Synchronously sends a length-prefixed JSON frame and reads one response frame
 /// along with any attached `SCM_RIGHTS` file descriptors.
-pub fn sync_roundtrip<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
+fn send_frame_with_fds(
     stream: &UnixStream,
-    req: &Req,
+    payload: &[u8],
     req_fds: Vec<OwnedFd>,
-) -> io::Result<(Resp, Vec<OwnedFd>)> {
-    let payload = serde_json::to_vec(req)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+) -> io::Result<()> {
     if payload.is_empty() || payload.len() > MAX_FRAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -796,7 +822,7 @@ pub fn sync_roundtrip<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
 
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(payload);
 
     let mut written = 0;
     let mut fds_opt = Some(req_fds);
@@ -819,10 +845,15 @@ pub fn sync_roundtrip<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         }
         written += sent;
     }
+    Ok(())
+}
 
-    let mut buf = Vec::new();
+fn read_next_raw_frame(
+    stream: &UnixStream,
+    buf: &mut Vec<u8>,
+    pending_fds: &mut VecDeque<OwnedFd>,
+) -> io::Result<Vec<u8>> {
     let mut scratch = [0_u8; 16 * 1024];
-    let mut pending_fds = VecDeque::new();
     loop {
         if buf.len() >= 4 {
             let body_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -833,10 +864,9 @@ pub fn sync_roundtrip<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
                 ));
             }
             if buf.len() >= 4 + body_len {
-                let parsed: Resp = serde_json::from_slice(&buf[4..4 + body_len])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                let fds: Vec<OwnedFd> = pending_fds.drain(..).collect();
-                return Ok((parsed, fds));
+                let body = buf[4..4 + body_len].to_vec();
+                buf.drain(..4 + body_len);
+                return Ok(body);
             }
         }
         let (n, fds) = recv_with_fds(stream, &mut scratch)?;
@@ -848,6 +878,36 @@ pub fn sync_roundtrip<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         }
         buf.extend_from_slice(&scratch[..n]);
         pending_fds.extend(fds);
+    }
+}
+
+pub fn sync_roundtrip<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
+    stream: &UnixStream,
+    req: &Req,
+    req_fds: Vec<OwnedFd>,
+) -> io::Result<(Resp, Vec<OwnedFd>)> {
+    let payload = serde_json::to_vec(req)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let expected_id = serde_json::to_value(req)
+        .ok()
+        .and_then(|v| v.get("id").and_then(Value::as_u64));
+    send_frame_with_fds(stream, &payload, req_fds)?;
+
+    let mut buf = Vec::new();
+    let mut pending_fds = VecDeque::new();
+    loop {
+        let body = read_next_raw_frame(stream, &mut buf, &mut pending_fds)?;
+        if let Some(req_id) = expected_id {
+            let val: Value = serde_json::from_slice(&body)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            if val.get("id").and_then(Value::as_u64) != Some(req_id) {
+                continue;
+            }
+        }
+        let parsed: Resp = serde_json::from_slice(&body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let fds: Vec<OwnedFd> = pending_fds.drain(..).collect();
+        return Ok((parsed, fds));
     }
 }
 
@@ -994,6 +1054,8 @@ mod tests {
             next_id: 10,
             instance_dir: PathBuf::new(),
             session_id: "sess_test".to_string(),
+            read_buf: Vec::new(),
+            pending_fds: VecDeque::new(),
         };
 
         let srv_handle = std::thread::spawn(move || {
@@ -1044,5 +1106,68 @@ mod tests {
             reqs[1].params["kinematics"],
             json!({ "profile": "bezier", "duration_ms": 120 })
         );
+    }
+
+    #[test]
+    fn roundtrip_skips_coalesced_unsolicited_event_frames() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let mut ipc = KomaIpcClient {
+            stream: client,
+            next_id: 1,
+            instance_dir: PathBuf::new(),
+            session_id: "sess_test".to_string(),
+            read_buf: Vec::new(),
+            pending_fds: VecDeque::new(),
+        };
+
+        let srv_handle = std::thread::spawn(move || {
+            let mut req_buf = [0_u8; 2048];
+            let (n, _) = recv_with_fds(&server, &mut req_buf).unwrap();
+            let req1: KomaRpcRequest = serde_json::from_slice(&req_buf[4..n]).unwrap();
+            assert_eq!(req1.id, 1);
+
+            let event_body = serde_json::to_vec(&json!({
+                "topic": "workspace_lease",
+                "ws_id": "ws_01",
+                "epoch": 2,
+                "event": { "EpochChanged": { "new_epoch": 2 } }
+            }))
+            .unwrap();
+            let resp1_body = serde_json::to_vec(&KomaRpcResponse {
+                id: req1.id,
+                result: Some(json!({ "ok": true, "epoch": 2 })),
+                error: None,
+            })
+            .unwrap();
+            // Coalesce an unsolicited event + RPC #1 response + a trailing event into ONE write.
+            let mut combined = Vec::new();
+            for body in [&event_body, &resp1_body, &event_body] {
+                combined.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                combined.extend_from_slice(body);
+            }
+            send_with_fds(&server, &combined, &[]).unwrap();
+
+            // Next RPC must still succeed after skipping the buffered trailing event.
+            let (n2, _) = recv_with_fds(&server, &mut req_buf).unwrap();
+            let req2: KomaRpcRequest = serde_json::from_slice(&req_buf[4..n2]).unwrap();
+            assert_eq!(req2.id, 2);
+            let resp2_body = serde_json::to_vec(&KomaRpcResponse {
+                id: req2.id,
+                result: Some(json!({ "ok": true, "epoch": 3 })),
+                error: None,
+            })
+            .unwrap();
+            let mut f2 = (resp2_body.len() as u32).to_le_bytes().to_vec();
+            f2.extend_from_slice(&resp2_body);
+            send_with_fds(&server, &f2, &[]).unwrap();
+        });
+
+        let r1 = ipc
+            .drag_xy("ws_01", 1, 10.0, 20.0, 30.0, 40.0, "left", "spring", 120)
+            .unwrap();
+        let r2 = ipc.tap_key("ws_01", r1, "Return").unwrap();
+        assert_eq!(r1, 2);
+        assert_eq!(r2, 3);
+        srv_handle.join().unwrap();
     }
 }
