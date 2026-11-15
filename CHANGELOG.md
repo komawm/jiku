@@ -5,6 +5,20 @@ incubation line before a formal `0.1.0` release.
 
 ## [Unreleased]
 
+### Planned for `v0.1.0`
+
+- Live PipeWire hardware microphone capture and speaker playout for interactive
+  `jiku live` sessions.
+- Production Linux Landlock / systemd sandbox hardening verified on host targets.
+- Live2D / VRM companion rendering UI consuming `AvatarCue` streams.
+
+## [0.0.1] - 2026-11-15
+
+Initial runnable `0.0.x` development prerelease shipping multi-architecture
+(`x86_64-unknown-linux-gnu` and 16 KiB page-aligned `aarch64-unknown-linux-gnu`)
+binary archives (`jikud` and `jiku`) alongside the source archive. Not an
+accepted `v0.1.0` product release.
+
 ### Added
 
 - Runnable `jikud` desktop orchestration daemon with `$XDG_RUNTIME_DIR/jiku.sock`
@@ -34,6 +48,14 @@ incubation line before a formal `0.1.0` release.
   `jiku.avatar.set_emotion`), SQLite WAL + FTS5 trajectory/skill store in
   `jiku-memory`, TTS/notifier providers in `jiku-tts`, `~/JikuBox` classifier
   in `jikud::jikubox`, and [`skills/SKILL.md`](skills/SKILL.md).
+- Three-Driver decision contracts (`DecisionsDriver`, `TurnModelDriver`,
+  `LiveSessionDriver`), `DecisionCompiler`, and configurable defaults in
+  `examples/config.toml`.
+- Multi-architecture release tooling (`scripts/package-release.sh`,
+  `just package-release`, `scripts/package-source.sh`) producing
+  `jiku-<version>-x86_64-unknown-linux-gnu.tar.gz`,
+  `jiku-<version>-aarch64-unknown-linux-gnu.tar.gz`, `jiku-<version>-src.tar.gz`,
+  and `SHA256SUMS`.
 
 ### Known limits (deferred to `v0.1.0`)
 
@@ -41,37 +63,6 @@ incubation line before a formal `0.1.0` release.
   `jiku live` sessions.
 - Production Linux Landlock / systemd sandbox hardening verified on host targets.
 - Live2D / VRM companion rendering UI consuming `AvatarCue` streams.
-
-## [0.0.1] - 2026-11-14
-
-Source-only development prerelease of the library-only scaffold. There is no
-`jiku` or `jikud` executable, functioning daemon, or network provider
-integration in this release.
-
-### Added
-
-- Three-Driver model contracts in `jikud`: `DecisionsDriver`,
-  `TurnModelDriver`, and optional `LiveSessionDriver` as pure-data types with
-  unit-tested invariants.
-- `DecisionExecutionMode` selecting `NativeDecisionsApi` when a dedicated
-  decision model is configured and falling back to
-  `EmulatedStructuredTextModel` (structured prompt plus JSON Schema
-  constraints on the primary text/VLM model) otherwise.
-- `DecisionCompiler` primitives compiling decision distributions into
-  `TimeSlotMacro`, `BernoulliExpectedStep`, and `ThresholdProbe` steps, plus
-  sub-cell grid centroid interpolation.
-- Configurable defaults via `Default` implementations for `GridSpec`,
-  `DecisionCompilerConfig`, and `LiveSessionConfig`, documented in
-  `examples/config.toml`.
-- Source release tooling: `scripts/package-source.sh`, `just package-source`,
-  and a tag-triggered prerelease workflow.
-
-### Known limits
-
-- Library-only scaffold: no daemon, no CLI binary, no installable service.
-- No network provider integration; provider settings in `examples/` are
-  design inputs only.
-- Memory and speech crates are documentation-only boundaries.
 
 [Unreleased]: https://github.com/komawm/jiku/compare/v0.0.1...HEAD
 [0.0.1]: https://github.com/komawm/jiku/releases/tag/v0.0.1

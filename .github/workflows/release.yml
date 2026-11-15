@@ -1,12 +1,17 @@
 name: Release
 
-# Source-only development prerelease for the library-only Jiku scaffold.
-# Tag pushes publish a GitHub prerelease; manual runs are dry runs that only
-# upload the workflow artifact.
+# Development prerelease for Jiku (`jikud` + `jiku` multi-arch binary and source archives).
+# Tag pushes publish a GitHub prerelease; manual runs build and smoke-test all artifacts.
 on:
   push:
     tags: ["v*.*.*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (X.Y.Z) for manual dry-run packaging"
+        required: true
+        default: "0.0.1"
+        type: string
 
 permissions:
   contents: read
@@ -27,16 +32,20 @@ jobs:
       - name: Resolve and check release version
         id: version
         env:
+          EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           workspace_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
-          if [[ "$REF_TYPE" == "tag" ]]; then
-            tag_version="${REF_NAME#v}"
-            if [[ "$tag_version" != "$workspace_version" ]]; then
-              echo "::error::Tag $REF_NAME does not match workspace.package.version $workspace_version"
-              exit 1
-            fi
+          if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
+            target_version="${REF_NAME#v}"
+          else
+            target_version="$INPUT_VERSION"
+          fi
+          if [[ "$target_version" != "$workspace_version" ]]; then
+            echo "::error::Release version '$target_version' does not match workspace.package.version '$workspace_version'"
+            exit 1
           fi
           echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
@@ -49,7 +58,9 @@ jobs:
         with:
           toolchain: ${{ steps.rust.outputs.channel }}
           components: rustfmt, clippy
-      # Equivalent of `just check`; actionlint runs from its pinned image.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: verify-${{ steps.rust.outputs.channel }}
       - name: Validate descriptors
         run: just metadata
       - name: Lint shell entry points
@@ -65,33 +76,122 @@ jobs:
       - name: Enforce Clippy warnings
         run: just clippy
       - name: Run available tests
-        run: just test
+        run: env -u GEMINI_API_KEY -u OPENCODE_GO_API_KEY just test
 
-  build:
+  build-source:
     name: Build source archive
     needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Package source
+        with:
+          fetch-depth: 0
+      - name: Package source archive
         env:
           VERSION: ${{ needs.verify.outputs.version }}
+          OUT_DIR: ${{ runner.temp }}/release-src
         run: |
-          bash scripts/package-source.sh --version "$VERSION" --out dist
-          (cd dist && sha256sum -c SHA256SUMS)
+          bash scripts/package-source.sh --version "$VERSION" --out "$OUT_DIR"
+          (cd "$OUT_DIR" && sha256sum -c SHA256SUMS)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: jiku-source
-          path: dist/
+          name: jiku-release-${{ needs.verify.outputs.version }}-source
+          path: ${{ runner.temp }}/release-src/jiku-*-src.tar.gz
           if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: Build release archive (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Resolve pinned Rust channel
+        id: rust
+        run: echo "channel=$(bash scripts/rust-channel.sh)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-${{ matrix.target }}-${{ steps.rust.outputs.channel }}
+      - name: Package release archive
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          OUT_DIR: ${{ runner.temp }}/release
+        run: bash scripts/package-release.sh --version "$VERSION" --target "$TARGET" --out "$OUT_DIR"
+      - name: Smoke-test packaged binaries
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          OUT_DIR: ${{ runner.temp }}/release
+        run: |
+          cd "$OUT_DIR"
+          sha256sum -c SHA256SUMS
+          tar -xzf "jiku-$VERSION-$TARGET.tar.gz"
+          "jiku-$VERSION-$TARGET/bin/jikud" --headless-check
+          "jiku-$VERSION-$TARGET/bin/jikud" --validate-config \
+            --config "jiku-$VERSION-$TARGET/examples/config.toml" \
+            --policy "jiku-$VERSION-$TARGET/examples/init.lua"
+          "jiku-$VERSION-$TARGET/bin/jiku" --version
+          rm -rf "jiku-$VERSION-$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: jiku-release-${{ needs.verify.outputs.version }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/release/jiku-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble release checksums
+    needs: [verify, build, build-source]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: jiku-release-${{ needs.verify.outputs.version }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release
+      - name: Generate unified SHA256SUMS
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          shopt -s nullglob
+          tarballs=(jiku-*.tar.gz)
+          if [ "${#tarballs[@]}" -ne 3 ]; then
+            echo "::error::expected 3 release tarballs, found ${#tarballs[*]}"
+            exit 1
+          fi
+          LC_ALL=C sha256sum "${tarballs[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: jiku-release-${{ needs.verify.outputs.version }}
+          path: |
+            ${{ runner.temp }}/release/jiku-*.tar.gz
+            ${{ runner.temp }}/release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
 
   publish:
     name: Publish GitHub prerelease
-    if: github.ref_type == 'tag'
-    needs: [verify, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, assemble]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     environment: release
     permissions:
       contents: write
@@ -99,35 +199,63 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: jiku-source
-          path: dist
-      - name: Verify checksums
-        run: (cd dist && sha256sum -c SHA256SUMS)
+          name: jiku-release-${{ needs.verify.outputs.version }}
+          path: ${{ runner.temp }}/release
+      - name: Verify downloaded checksums
+        working-directory: ${{ runner.temp }}/release
+        run: sha256sum -c SHA256SUMS
       - name: Extract release notes
         env:
           VERSION: ${{ needs.verify.outputs.version }}
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
         run: |
-          awk -v version="$VERSION" '
-            $0 ~ "^## \\[" version "\\]" { found = 1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
-          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"; then
-            echo "::error::CHANGELOG.md has no section for $VERSION"
-            exit 1
-          fi
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          lines = Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          header = re.compile(r"^## \[" + re.escape(version) + r"\]")
+          body, inside = [], False
+          for line in lines:
+              if header.match(line):
+                  inside = True
+                  continue
+              if inside and line.startswith("## ["):
+                  break
+              if inside:
+                  body.append(line)
+          text = "\n".join(body).strip()
+          if not text:
+              raise SystemExit(f"CHANGELOG.md section for {version} is empty or missing")
+          notes = (
+              "> Development prerelease on the 0.0.x incubation line. It is not the "
+              "accepted v0.1.0 product release and makes no hardware, PipeWire audio, "
+              "Landlock sandbox, or Live2D/VRM claims.\n\n"
+              + text
+              + "\n\n### Verify the download\n\n```sh\nsha256sum -c SHA256SUMS\n```\n"
+          )
+          Path(os.environ["NOTES_FILE"]).write_text(notes, encoding="utf-8")
+          PY
       - name: Create or update prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
         run: |
+          shopt -s nullglob
+          assets=("$RELEASE_DIR"/jiku-*.tar.gz "$RELEASE_DIR/SHA256SUMS")
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
+            gh release upload "$TAG" "${assets[@]}" --clobber
           else
-            gh release create "$TAG" dist/* \
+            gh release create "$TAG" "${assets[@]}" \
               --prerelease \
               --verify-tag \
-              --title "Jiku $TAG (development prerelease, library scaffold)" \
-              --notes-file "$RUNNER_TEMP/release-notes.md"
+              --title "Jiku $TAG (development prerelease)" \
+              --notes-file "$NOTES_FILE"
           fi
+          gh release view "$TAG" --json tagName,isPrerelease,assets \
+            --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'

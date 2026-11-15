@@ -43,3 +43,7 @@ hooks-install:
 # Source-only development prerelease archive, manifest and checksums.
 package-source version out="dist":
     bash scripts/package-source.sh --version "{{version}}" --out "{{out}}"
+
+# Prebuilt binary development prerelease archive, manifest and checksums.
+package-release version target="x86_64-unknown-linux-gnu" out="dist":
+    bash scripts/package-release.sh --version "{{version}}" --target "{{target}}" --out "{{out}}"
