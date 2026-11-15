@@ -40,7 +40,7 @@ use crate::{
     jikubox::{JikuBoxReport, classify_dropbox_dir},
     koma_ipc::{
         ERR_CODE_HUMAN_PREEMPTED, ERR_CODE_PROTECTED_SURFACE, ERR_CODE_STALE_EPOCH,
-        KomaCapturedFrame, KomaIpcClient, KomaIpcError, KomaWorkspaceSummary,
+        KomaCapturedFrame, KomaIpcClient, KomaIpcError, KomaPathWaypoint, KomaWorkspaceSummary,
     },
     lua_policy::JikuLuaPolicy,
 };
@@ -219,6 +219,45 @@ pub enum PlannedKomaStep {
         #[serde(default = "default_drag_duration_ms")]
         duration_ms: u64,
     },
+    /// Smoothly move the virtual pointer (without pressing a button) along a multi-waypoint spline.
+    MovePath {
+        /// Ordered list of local `[x, y]` waypoints.
+        #[serde(default)]
+        points: Vec<[f64; 2]>,
+        /// Ordered list of 15x15 `grid_225` cell labels (`"A1"`..=`"O15"`), used when `points` is empty.
+        #[serde(default)]
+        cells: Vec<String>,
+        /// Spline mode (`"auto"`, `"catmull_rom"`, `"bezier"`).
+        #[serde(default = "default_path_spline")]
+        spline: String,
+        /// Kinematic velocity profile (`"spring"`, `"minimum_jerk"`, `"bezier"`, `"instant"`).
+        #[serde(default = "default_drag_profile")]
+        profile: String,
+        /// Requested trajectory duration in milliseconds.
+        #[serde(default = "default_path_duration_ms")]
+        duration_ms: u64,
+    },
+    /// Drag the virtual pointer with a button held along a smooth multi-waypoint spline.
+    DragPath {
+        /// Ordered list of local `[x, y]` waypoints.
+        #[serde(default)]
+        points: Vec<[f64; 2]>,
+        /// Ordered list of 15x15 `grid_225` cell labels (`"A1"`..=`"O15"`), used when `points` is empty.
+        #[serde(default)]
+        cells: Vec<String>,
+        /// Mouse button (`"left"`, `"right"`, `"middle"`).
+        #[serde(default = "default_mouse_button")]
+        button: String,
+        /// Spline mode (`"auto"`, `"catmull_rom"`, `"bezier"`).
+        #[serde(default = "default_path_spline")]
+        spline: String,
+        /// Kinematic velocity profile (`"spring"`, `"minimum_jerk"`, `"bezier"`, `"instant"`).
+        #[serde(default = "default_drag_profile")]
+        profile: String,
+        /// Requested trajectory duration in milliseconds.
+        #[serde(default = "default_path_duration_ms")]
+        duration_ms: u64,
+    },
     /// Inject UTF-8 text into the focused Wayland client via `vseat.inject_text`.
     InjectText {
         /// Text string to commit via `zwp_text_input_v3` / clipboard fallback.
@@ -252,12 +291,28 @@ const fn default_drag_duration_ms() -> u64 {
     120
 }
 
+fn default_path_spline() -> String {
+    "auto".to_string()
+}
+
+const fn default_path_duration_ms() -> u64 {
+    260
+}
+
 fn normalize_kinematic_profile(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "instant" => "instant",
         "minimum_jerk" | "minimum-jerk" | "min_jerk" => "minimum_jerk",
         "bezier" => "bezier",
         _ => "spring",
+    }
+}
+
+fn normalize_path_spline(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "catmull_rom" | "catmull-rom" => "catmull_rom",
+        "bezier" => "bezier",
+        _ => "auto",
     }
 }
 
@@ -572,59 +627,71 @@ impl JikuEngine {
             bail!("run goal must not be empty");
         }
 
-        let started = Instant::now();
         let requested_ws = workspace_override
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.config.koma.default_workspace)
             .to_string();
 
-        let mut ipc_opt: Option<KomaIpcClient> = None;
-        let mut target_ws = requested_ws.clone();
-        let mut active_app_id = String::new();
-        let mut active_title = String::new();
-        let mut active_win_id = String::new();
-        let mut captured: Option<KomaCapturedFrame> = None;
-        let mut inventory: Vec<KomaWorkspaceSummary> = Vec::new();
-
-        match KomaIpcClient::connect_discovered(&requested_ws, true) {
-            Ok(mut ipc) => {
-                inventory = ipc.inventory()?;
-                if let Some(ws) = inventory
-                    .iter()
-                    .find(|w| w.ws_id == requested_ws)
-                    .or_else(|| inventory.first())
-                {
-                    target_ws = ws.ws_id.clone();
-                    if let Some(win) = &ws.active_window {
-                        active_app_id = win.app_id.clone();
-                        active_title = win.title.clone();
-                        active_win_id = win.win_id.clone();
-                    }
-                } else {
-                    bail!("Koma reported zero active workspaces");
-                }
-
-                let frame =
-                    ipc.capture_frame(&target_ws, &self.config.koma.default_overlay, 1280)?;
-                self.l0_ring.push(L0FrameEntry {
-                    epoch: frame.epoch,
-                    workspace: target_ws.clone(),
-                    width: frame.width,
-                    height: frame.height,
-                    dhash: frame.dhash64,
-                    timestamp_ms: now_unix_ms(),
-                });
-                captured = Some(frame);
-                ipc_opt = Some(ipc);
-            }
+        let ipc_opt = match KomaIpcClient::connect_discovered(&requested_ws, true) {
+            Ok(ipc) => Some(ipc),
             Err(err) => {
                 if !dry_run {
                     return Err(anyhow!(
                         "cannot run live task without active Koma compositor IPC (pass --dry-run to preview without Koma): {err}"
                     ));
                 }
+                None
             }
+        };
+
+        self.run_task_with_ipc(&requested_ws, goal, dry_run, force_emulate, ipc_opt)
+            .await
+    }
+
+    async fn run_task_with_ipc(
+        &mut self,
+        requested_ws: &str,
+        goal: &str,
+        dry_run: bool,
+        force_emulate: bool,
+        mut ipc_opt: Option<KomaIpcClient>,
+    ) -> anyhow::Result<RunTaskReport> {
+        let started = Instant::now();
+        let mut target_ws = requested_ws.to_string();
+        let mut active_app_id = String::new();
+        let mut active_title = String::new();
+        let mut active_win_id = String::new();
+        let mut captured: Option<KomaCapturedFrame> = None;
+        let mut inventory: Vec<KomaWorkspaceSummary> = Vec::new();
+
+        if let Some(ipc) = ipc_opt.as_mut() {
+            inventory = ipc.inventory()?;
+            if let Some(ws) = inventory
+                .iter()
+                .find(|w| w.ws_id == requested_ws)
+                .or_else(|| inventory.first())
+            {
+                target_ws = ws.ws_id.clone();
+                if let Some(win) = &ws.active_window {
+                    active_app_id = win.app_id.clone();
+                    active_title = win.title.clone();
+                    active_win_id = win.win_id.clone();
+                }
+            } else {
+                bail!("Koma reported zero active workspaces");
+            }
+
+            let frame = ipc.capture_frame(&target_ws, &self.config.koma.default_overlay, 1280)?;
+            self.l0_ring.push(L0FrameEntry {
+                epoch: frame.epoch,
+                workspace: target_ws.clone(),
+                width: frame.width,
+                height: frame.height,
+                dhash: frame.dhash64,
+                timestamp_ms: now_unix_ms(),
+            });
+            captured = Some(frame);
         }
 
         let mut injected_notes = Vec::new();
@@ -927,6 +994,7 @@ impl JikuEngine {
                     Err(StepHalt::Fatal(e)) => return Err(e),
                 }
             }
+            let _ = ipc.settle_cursor(&target_ws, false);
         }
 
         let mut staged_skill_id = None;
@@ -1321,10 +1389,99 @@ impl JikuEngine {
     }
 }
 
+const MIN_PATH_WAYPOINTS: usize = 2;
+const MAX_PATH_WAYPOINTS: usize = 128;
+
+#[derive(Debug)]
 enum StepHalt {
     HumanPreempted,
     ProtectedSurface,
     Fatal(anyhow::Error),
+}
+
+fn normalize_grid_cell(cell: &str) -> Result<String, StepHalt> {
+    let normalized = cell.trim().to_ascii_uppercase();
+    if GridSpec::default().parse_cell_label(&normalized).is_none() {
+        return Err(StepHalt::Fatal(anyhow!(
+            "planner produced invalid grid_225 cell label `{cell}`"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn resolve_path_waypoints(
+    points: &[[f64; 2]],
+    cells: &[String],
+) -> Result<Vec<KomaPathWaypoint>, StepHalt> {
+    if !points.is_empty() {
+        if !(MIN_PATH_WAYPOINTS..=MAX_PATH_WAYPOINTS).contains(&points.len()) {
+            return Err(StepHalt::Fatal(anyhow!(
+                "path step requires {MIN_PATH_WAYPOINTS}..={MAX_PATH_WAYPOINTS} waypoints, got {}",
+                points.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(points.len());
+        for &[x, y] in points {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(StepHalt::Fatal(anyhow!(
+                    "path step waypoint coordinates must be finite: [{x}, {y}]"
+                )));
+            }
+            out.push(KomaPathWaypoint::Xy { x, y });
+        }
+        return Ok(out);
+    }
+
+    if !(MIN_PATH_WAYPOINTS..=MAX_PATH_WAYPOINTS).contains(&cells.len()) {
+        return Err(StepHalt::Fatal(anyhow!(
+            "path step requires {MIN_PATH_WAYPOINTS}..={MAX_PATH_WAYPOINTS} waypoints, got {}",
+            cells.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(cells.len());
+    for cell in cells {
+        out.push(KomaPathWaypoint::Grid225(normalize_grid_cell(cell)?));
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_path_step(
+    ipc: &mut KomaIpcClient,
+    ws_id: &str,
+    expected_epoch: u64,
+    points: &[[f64; 2]],
+    cells: &[String],
+    button: Option<&str>,
+    spline: &str,
+    profile: &str,
+    duration_ms: u64,
+) -> Result<(Result<u64, KomaIpcError>, Duration), StepHalt> {
+    let waypoints = resolve_path_waypoints(points, cells)?;
+    let norm_spline = normalize_path_spline(spline);
+    let norm_profile = normalize_kinematic_profile(profile);
+    let dur = duration_ms.min(5_000);
+    let settle_delay = drag_settle_delay(norm_profile, dur);
+    let res = match button {
+        Some(btn) => ipc.drag_path(
+            ws_id,
+            expected_epoch,
+            &waypoints,
+            btn,
+            norm_spline,
+            norm_profile,
+            dur,
+        ),
+        None => ipc.move_path(
+            ws_id,
+            expected_epoch,
+            &waypoints,
+            norm_spline,
+            norm_profile,
+            dur,
+        ),
+    };
+    Ok((res, settle_delay))
 }
 
 fn execute_step_with_epoch_retry(
@@ -1345,12 +1502,7 @@ fn execute_step_with_epoch_retry(
                 button,
                 clicks,
             } => {
-                let normalized = cell.trim().to_ascii_uppercase();
-                if GridSpec::default().parse_cell_label(&normalized).is_none() {
-                    return Err(StepHalt::Fatal(anyhow!(
-                        "planner produced invalid grid_225 cell label `{cell}`"
-                    )));
-                }
+                let normalized = normalize_grid_cell(cell)?;
                 (
                     ipc.click_grid(ws_id, *current_epoch, &normalized, button, (*clicks).max(1)),
                     Duration::from_millis(35),
@@ -1398,18 +1550,8 @@ fn execute_step_with_epoch_retry(
                 profile,
                 duration_ms,
             } => {
-                let norm_from = from_cell.trim().to_ascii_uppercase();
-                if GridSpec::default().parse_cell_label(&norm_from).is_none() {
-                    return Err(StepHalt::Fatal(anyhow!(
-                        "planner produced invalid grid_225 cell label `{from_cell}`"
-                    )));
-                }
-                let norm_to = to_cell.trim().to_ascii_uppercase();
-                if GridSpec::default().parse_cell_label(&norm_to).is_none() {
-                    return Err(StepHalt::Fatal(anyhow!(
-                        "planner produced invalid grid_225 cell label `{to_cell}`"
-                    )));
-                }
+                let norm_from = normalize_grid_cell(from_cell)?;
+                let norm_to = normalize_grid_cell(to_cell)?;
                 let norm_profile = normalize_kinematic_profile(profile);
                 let dur = (*duration_ms).min(5_000);
                 (
@@ -1424,6 +1566,37 @@ fn execute_step_with_epoch_retry(
                     ),
                     drag_settle_delay(norm_profile, dur),
                 )
+            }
+            PlannedKomaStep::MovePath {
+                points,
+                cells,
+                spline,
+                profile,
+                duration_ms,
+            }
+            | PlannedKomaStep::DragPath {
+                points,
+                cells,
+                spline,
+                profile,
+                duration_ms,
+                ..
+            } => {
+                let button = match step {
+                    PlannedKomaStep::DragPath { button, .. } => Some(button.as_str()),
+                    _ => None,
+                };
+                dispatch_path_step(
+                    ipc,
+                    ws_id,
+                    *current_epoch,
+                    points,
+                    cells,
+                    button,
+                    spline,
+                    profile,
+                    *duration_ms,
+                )?
             }
             PlannedKomaStep::InjectText { text } => (
                 ipc.inject_text(ws_id, *current_epoch, text),
@@ -1844,6 +2017,8 @@ fn build_planner_system_prompt() -> String {
         "    {\"action\": \"click_xy\", \"x\": 640, \"y\": 400, \"button\": \"left\", \"clicks\": 1},\n",
         "    {\"action\": \"drag_xy\", \"from_x\": 180, \"from_y\": 260, \"to_x\": 520, \"to_y\": 260, \"button\": \"left\", \"profile\": \"spring\", \"duration_ms\": 140},\n",
         "    {\"action\": \"drag_cell\", \"from_cell\": \"C4\", \"to_cell\": \"M4\", \"button\": \"left\", \"profile\": \"bezier\", \"duration_ms\": 120},\n",
+        "    {\"action\": \"move_path\", \"points\": [[120, 240], [260, 180], [420, 240]], \"spline\": \"catmull_rom\", \"profile\": \"spring\", \"duration_ms\": 260},\n",
+        "    {\"action\": \"drag_path\", \"points\": [[180, 260], [280, 190], [380, 260]], \"button\": \"left\", \"spline\": \"catmull_rom\", \"profile\": \"spring\", \"duration_ms\": 320},\n",
         "    {\"action\": \"inject_text\", \"text\": \"command without trailing newline\"},\n",
         "    {\"action\": \"key\", \"chord\": \"Return\"},\n",
         "    {\"action\": \"wait_ms\", \"ms\": 150}\n",
@@ -1851,10 +2026,11 @@ fn build_planner_system_prompt() -> String {
         "  \"candidate_skill\": null\n",
         "}\n",
         "Rules:\n",
-        "- Only use action values: \"click_cell\", \"click_xy\", \"drag_xy\", \"drag_cell\", \"inject_text\", \"key\", \"wait_ms\".\n",
+        "- Only use action values: \"click_cell\", \"click_xy\", \"drag_xy\", \"drag_cell\", \"move_path\", \"drag_path\", \"inject_text\", \"key\", \"wait_ms\".\n",
         "- Grid overlay cells use 15x15 labels A1..O15 (columns A..O left-to-right, rows 1..15 top-to-bottom).\n",
-        "- When `Active window geometry: WxH at (X, Y)` is present, `click_xy` and `drag_xy` coordinates are local to that active window (`0..W`, `0..H`).\n",
-        "- For `drag_xy` / `drag_cell`, `profile` may be \"spring\" (damped Hooke spring dynamics), \"bezier\", \"minimum_jerk\", or \"instant\".\n",
+        "- When `Active window geometry: WxH at (X, Y)` is present, `click_xy`, `drag_xy`, `move_path`, and `drag_path` `points` coordinates are local to that active window (`0..W`, `0..H`).\n",
+        "- For `drag_xy` / `drag_cell` / `move_path` / `drag_path`, `profile` may be \"spring\" (damped Hooke spring dynamics), \"bezier\", \"minimum_jerk\", or \"instant\".\n",
+        "- For `move_path` (hover) and `drag_path` (button-held stroke), specify 2..=128 waypoints via either `points` (`[[x, y], ...]`) or `cells` (`[\"C4\", ...]`), and `spline`: \"auto\", \"catmull_rom\" (for smooth multi-point curves, handwriting, circles, and freehand strokes), or \"bezier\".\n",
         "- When the active window is already a terminal (such as foot) and you want to run a command, click the terminal center if unfocused or directly emit inject_text (without newline) followed by {\"action\": \"key\", \"chord\": \"Return\"}.\n",
         "- Keep steps <= 48 and preserve exact text requested by the user."
     )
@@ -2097,5 +2273,559 @@ mod tests {
             &[],
         );
         assert!(ctx.contains("Active window geometry: 1256x776 at (12, 12)"));
+    }
+
+    #[test]
+    fn planned_koma_step_move_path_and_drag_path_serde_and_spline_normalization() {
+        let raw = json!([
+            {
+                "action": "move_path",
+                "points": [[100.0, 200.0], [220.0, 140.0], [340.0, 200.0]]
+            },
+            {
+                "action": "drag_path",
+                "cells": ["C4", "H8", "M4"],
+                "button": "right",
+                "spline": "catmull_rom",
+                "profile": "minimum_jerk",
+                "duration_ms": 400
+            },
+            {
+                "action": "drag_path",
+                "points": [[10.0, 20.0], [30.0, 40.0]]
+            }
+        ]);
+        let steps: Vec<PlannedKomaStep> = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            steps[0],
+            PlannedKomaStep::MovePath {
+                points: vec![[100.0, 200.0], [220.0, 140.0], [340.0, 200.0]],
+                cells: Vec::new(),
+                spline: "auto".to_string(),
+                profile: "spring".to_string(),
+                duration_ms: 260,
+            }
+        );
+        assert_eq!(
+            steps[1],
+            PlannedKomaStep::DragPath {
+                points: Vec::new(),
+                cells: vec!["C4".to_string(), "H8".to_string(), "M4".to_string()],
+                button: "right".to_string(),
+                spline: "catmull_rom".to_string(),
+                profile: "minimum_jerk".to_string(),
+                duration_ms: 400,
+            }
+        );
+        assert_eq!(
+            steps[2],
+            PlannedKomaStep::DragPath {
+                points: vec![[10.0, 20.0], [30.0, 40.0]],
+                cells: Vec::new(),
+                button: "left".to_string(),
+                spline: "auto".to_string(),
+                profile: "spring".to_string(),
+                duration_ms: 260,
+            }
+        );
+
+        assert_eq!(normalize_path_spline("catmull_rom"), "catmull_rom");
+        assert_eq!(normalize_path_spline(" Catmull-Rom "), "catmull_rom");
+        assert_eq!(normalize_path_spline("bezier"), "bezier");
+        assert_eq!(normalize_path_spline("auto"), "auto");
+        assert_eq!(normalize_path_spline("unknown"), "auto");
+
+        let prompt = build_planner_system_prompt();
+        assert!(prompt.contains("move_path"));
+        assert!(prompt.contains("drag_path"));
+        assert!(prompt.contains("catmull_rom"));
+    }
+
+    #[test]
+    fn path_waypoint_validation_rejects_invalid_counts_coords_and_cells() {
+        assert!(matches!(
+            resolve_path_waypoints(&[], &[]),
+            Err(StepHalt::Fatal(_))
+        ));
+        assert!(matches!(
+            resolve_path_waypoints(&[[10.0, 20.0]], &["A1".to_string(), "B2".to_string()]),
+            Err(StepHalt::Fatal(_))
+        ));
+        assert!(matches!(
+            resolve_path_waypoints(&[], &["A1".to_string()]),
+            Err(StepHalt::Fatal(_))
+        ));
+
+        let too_many_points = vec![[1.0, 2.0]; 129];
+        assert!(matches!(
+            resolve_path_waypoints(&too_many_points, &[]),
+            Err(StepHalt::Fatal(_))
+        ));
+        let too_many_cells = vec!["A1".to_string(); 129];
+        assert!(matches!(
+            resolve_path_waypoints(&[], &too_many_cells),
+            Err(StepHalt::Fatal(_))
+        ));
+
+        assert!(matches!(
+            resolve_path_waypoints(&[[f64::NAN, 10.0], [20.0, 30.0]], &[]),
+            Err(StepHalt::Fatal(_))
+        ));
+        assert!(matches!(
+            resolve_path_waypoints(&[[10.0, 10.0], [20.0, f64::INFINITY]], &[]),
+            Err(StepHalt::Fatal(_))
+        ));
+        assert!(matches!(
+            resolve_path_waypoints(&[], &["A1".to_string(), "Z9".to_string()]),
+            Err(StepHalt::Fatal(_))
+        ));
+        assert!(matches!(
+            resolve_path_waypoints(&[], &["A1".to_string(), "A16".to_string()]),
+            Err(StepHalt::Fatal(_))
+        ));
+
+        let from_cells =
+            resolve_path_waypoints(&[], &[" c4 ".to_string(), "m9".to_string()]).unwrap();
+        assert_eq!(
+            from_cells,
+            vec![
+                KomaPathWaypoint::Grid225("C4".to_string()),
+                KomaPathWaypoint::Grid225("M9".to_string()),
+            ]
+        );
+
+        let preferred_points = resolve_path_waypoints(
+            &[[1.0, 2.0], [3.0, 4.0]],
+            &["INVALID".to_string(), "BAD".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            preferred_points,
+            vec![
+                KomaPathWaypoint::Xy { x: 1.0, y: 2.0 },
+                KomaPathWaypoint::Xy { x: 3.0, y: 4.0 },
+            ]
+        );
+
+        let max_points = vec![[1.0, 2.0]; 128];
+        assert_eq!(resolve_path_waypoints(&max_points, &[]).unwrap().len(), 128);
+
+        let (_server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut ipc = KomaIpcClient::from_test_stream(client);
+        let mut epoch = 1;
+        let bad_move = PlannedKomaStep::MovePath {
+            points: vec![[5.0, 5.0]],
+            cells: Vec::new(),
+            spline: "catmull_rom".to_string(),
+            profile: "spring".to_string(),
+            duration_ms: 260,
+        };
+        assert!(matches!(
+            execute_step_with_epoch_retry(&mut ipc, "ws_01", &mut epoch, &bad_move, "grid_225"),
+            Err(StepHalt::Fatal(_))
+        ));
+
+        let bad_drag = PlannedKomaStep::DragPath {
+            points: Vec::new(),
+            cells: vec!["A1".to_string(), "Z99".to_string()],
+            button: "left".to_string(),
+            spline: "auto".to_string(),
+            profile: "spring".to_string(),
+            duration_ms: 260,
+        };
+        assert!(matches!(
+            execute_step_with_epoch_retry(&mut ipc, "ws_01", &mut epoch, &bad_drag, "grid_225"),
+            Err(StepHalt::Fatal(_))
+        ));
+    }
+
+    #[test]
+    fn execute_step_with_epoch_retry_drag_path_retries_on_stale_epoch_and_clamps_duration() {
+        use crate::koma_ipc::{
+            KomaRpcError, KomaRpcResponse, create_sealed_test_rgba_memfd, read_test_rpc_request,
+            write_test_rpc_response,
+        };
+
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut ipc = KomaIpcClient::from_test_stream(client);
+
+        let srv_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut reqs = Vec::new();
+
+            let req1 = read_test_rpc_request(&server, &mut buf).unwrap();
+            assert_eq!(req1.method, "vseat.path");
+            assert_eq!(req1.params["expected_epoch"], 3);
+            reqs.push(req1.clone());
+            write_test_rpc_response(
+                &server,
+                &KomaRpcResponse {
+                    id: req1.id,
+                    result: None,
+                    error: Some(KomaRpcError {
+                        code: ERR_CODE_STALE_EPOCH,
+                        symbol: Some("ERR_STALE_EPOCH".to_string()),
+                        message: "epoch mismatch".to_string(),
+                        current_epoch: Some(7),
+                        retryable: Some(true),
+                    }),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+
+            let req2 = read_test_rpc_request(&server, &mut buf).unwrap();
+            assert_eq!(req2.method, "capture.frame");
+            reqs.push(req2.clone());
+            let (memfd, byte_len) = create_sealed_test_rgba_memfd(4, 4);
+            write_test_rpc_response(
+                &server,
+                &KomaRpcResponse {
+                    id: req2.id,
+                    result: Some(json!({
+                        "epoch": 7,
+                        "width": 4,
+                        "height": 4,
+                        "byte_len": byte_len,
+                        "has_protected_blackout": false,
+                        "grid_cells": 225,
+                    })),
+                    error: None,
+                },
+                vec![memfd],
+            )
+            .unwrap();
+
+            let req3 = read_test_rpc_request(&server, &mut buf).unwrap();
+            assert_eq!(req3.method, "vseat.path");
+            assert_eq!(req3.params["expected_epoch"], 7);
+            reqs.push(req3.clone());
+            write_test_rpc_response(
+                &server,
+                &KomaRpcResponse {
+                    id: req3.id,
+                    result: Some(json!({ "ok": true, "epoch": 8, "waypoints": 3 })),
+                    error: None,
+                },
+                Vec::new(),
+            )
+            .unwrap();
+
+            let req4 = read_test_rpc_request(&server, &mut buf).unwrap();
+            assert_eq!(req4.method, "vseat.path");
+            reqs.push(req4.clone());
+            write_test_rpc_response(
+                &server,
+                &KomaRpcResponse {
+                    id: req4.id,
+                    result: Some(json!({ "ok": true, "epoch": 9, "waypoints": 2 })),
+                    error: None,
+                },
+                Vec::new(),
+            )
+            .unwrap();
+
+            reqs
+        });
+
+        let mut current_epoch = 3_u64;
+        let drag_step = PlannedKomaStep::DragPath {
+            points: vec![[120.0, 240.0], [240.0, 180.0], [360.0, 240.0]],
+            cells: Vec::new(),
+            button: "left".to_string(),
+            spline: "catmull-rom".to_string(),
+            profile: "minimum-jerk".to_string(),
+            duration_ms: 12_000,
+        };
+        let drag_delay = execute_step_with_epoch_retry(
+            &mut ipc,
+            "ws_01",
+            &mut current_epoch,
+            &drag_step,
+            "grid_225",
+        )
+        .unwrap();
+        assert_eq!(current_epoch, 8);
+        assert_eq!(drag_delay, Duration::from_millis(5_050));
+
+        let move_step = PlannedKomaStep::MovePath {
+            points: Vec::new(),
+            cells: vec!["c4".to_string(), "h8".to_string()],
+            spline: "unexpected".to_string(),
+            profile: "spring".to_string(),
+            duration_ms: 260,
+        };
+        let move_delay = execute_step_with_epoch_retry(
+            &mut ipc,
+            "ws_01",
+            &mut current_epoch,
+            &move_step,
+            "grid_225",
+        )
+        .unwrap();
+        assert_eq!(current_epoch, 9);
+        assert_eq!(move_delay, Duration::from_millis(320));
+
+        let reqs = srv_handle.join().unwrap();
+        assert_eq!(reqs[2].params["spline"], "catmull_rom");
+        assert_eq!(reqs[2].params["button"], "left");
+        assert_eq!(reqs[2].params["hold_start_ms"], 20);
+        assert_eq!(reqs[2].params["hold_end_ms"], 20);
+        assert_eq!(
+            reqs[2].params["kinematics"],
+            json!({ "profile": "minimum_jerk", "duration_ms": 5_000 })
+        );
+
+        assert_eq!(reqs[3].params["expected_epoch"], 8);
+        assert_eq!(
+            reqs[3].params["waypoints"],
+            json!([{ "grid_225": "C4" }, { "grid_225": "H8" }])
+        );
+        assert_eq!(reqs[3].params["spline"], "auto");
+        assert_eq!(reqs[3].params["button"], Value::Null);
+        assert_eq!(reqs[3].params["hold_start_ms"], 0);
+        assert_eq!(reqs[3].params["hold_end_ms"], 0);
+    }
+
+    async fn spawn_mock_openai_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock OpenAI listener");
+        let addr = listener.local_addr().expect("mock OpenAI local addr");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    let header_end = loop {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, val) = line.split_once(':')?;
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                val.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_len {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+
+                    let req_body = String::from_utf8_lossy(&buf[header_end..]);
+                    let content = if req_body.contains("deterministic decision evaluator") {
+                        json!({
+                            "answers": {
+                                "q_in_scope": { "type": "noul", "noul": 0.96, "confidence": 0.96 },
+                                "q_safety_risk": { "type": "noul", "noul": 0.01, "confidence": 0.99 },
+                                "q_action_kind": {
+                                    "type": "choice",
+                                    "choice": "drag_or_draw",
+                                    "confidence": 0.95,
+                                    "probabilities": { "drag_or_draw": 0.95, "NONE_OR_OTHER": 0.05 }
+                                }
+                            }
+                        })
+                        .to_string()
+                    } else {
+                        json!({
+                            "summary": "Draw smooth curve on canvas",
+                            "steps": [{
+                                "action": "drag_path",
+                                "points": [[120.0, 240.0], [240.0, 160.0], [360.0, 240.0]],
+                                "button": "left",
+                                "spline": "catmull_rom",
+                                "profile": "instant",
+                                "duration_ms": 20
+                            }],
+                            "candidate_skill": null
+                        })
+                        .to_string()
+                    };
+
+                    let resp_body = json!({
+                        "choices": [{ "message": { "content": content } }],
+                        "usage": { "prompt_tokens": 12, "completion_tokens": 18 }
+                    })
+                    .to_string();
+                    let wire = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(wire.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        addr
+    }
+
+    fn spawn_mock_koma_server(
+        server: std::os::unix::net::UnixStream,
+    ) -> std::thread::JoinHandle<Vec<crate::koma_ipc::KomaRpcRequest>> {
+        use crate::koma_ipc::{
+            KomaRpcResponse, create_sealed_test_rgba_memfd, read_test_rpc_request,
+            write_test_rpc_response,
+        };
+
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut reqs = Vec::new();
+            while let Ok(req) = read_test_rpc_request(&server, &mut buf) {
+                let method = req.method.clone();
+                reqs.push(req.clone());
+                let (result, fds) = match method.as_str() {
+                    "scene.inventory" => (
+                        json!({
+                            "workspaces": [{
+                                "ws_id": "ws_01",
+                                "name": "main",
+                                "layout_mode": "dwindle",
+                                "epoch": 3,
+                                "is_human_preempted": false,
+                                "viewport": { "width": 1280, "height": 800 },
+                                "active_window": null
+                            }]
+                        }),
+                        Vec::new(),
+                    ),
+                    "capture.frame" => {
+                        let (memfd, byte_len) = create_sealed_test_rgba_memfd(4, 4);
+                        (
+                            json!({
+                                "epoch": 3,
+                                "width": 4,
+                                "height": 4,
+                                "byte_len": byte_len,
+                                "has_protected_blackout": false,
+                                "grid_cells": 225,
+                            }),
+                            vec![memfd],
+                        )
+                    }
+                    "vseat.path" => (
+                        json!({ "ok": true, "epoch": 4, "waypoints": 3 }),
+                        Vec::new(),
+                    ),
+                    "vseat.cursor_settle" => (json!({ "ok": true }), Vec::new()),
+                    other => panic!("unexpected Koma RPC method in mock server: {other}"),
+                };
+                write_test_rpc_response(
+                    &server,
+                    &KomaRpcResponse {
+                        id: req.id,
+                        result: Some(result),
+                        error: None,
+                    },
+                    fds,
+                )
+                .unwrap();
+            }
+            reqs
+        })
+    }
+
+    fn build_test_engine(mock_openai_addr: std::net::SocketAddr) -> JikuEngine {
+        let mut config = JikuConfig::default();
+        let prov = config
+            .providers
+            .get_mut("opencode_go")
+            .expect("default opencode_go provider");
+        prov.base_url = format!("http://{mock_openai_addr}/v1");
+        prov.api_key_env.clear();
+        config.daemon.audit_log = false;
+        config.notify.desktop_dbus = false;
+        config.tts.enabled = false;
+        config.validate().expect("test config validates");
+
+        JikuEngine {
+            config,
+            config_path: None,
+            policy_path: None,
+            lua_policy: JikuLuaPolicy::default(),
+            memory: SqliteMemoryStore::open_in_memory(1024).expect("in-memory sqlite"),
+            l0_ring: L0FrameRing::new(8),
+            decision_executor: DecisionExecutor::new(Duration::from_secs(10)).unwrap(),
+            turn_client: TurnModelClient::new(Duration::from_secs(10)).unwrap(),
+            notifier: DesktopNotifier {
+                enabled: false,
+                app_name: "JikuTest".to_string(),
+            },
+            tts: Box::new(NoopTtsProvider::default()),
+            last_avatar_cue: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_task_calls_vseat_cursor_settle_after_steps_and_skips_on_dry_run() {
+        let mock_addr = spawn_mock_openai_server().await;
+        let mut engine = build_test_engine(mock_addr);
+
+        let (server_live, client_live) = std::os::unix::net::UnixStream::pair().unwrap();
+        let srv_live = spawn_mock_koma_server(server_live);
+        let ipc_live = KomaIpcClient::from_test_stream(client_live);
+
+        let report_live = engine
+            .run_task_with_ipc("ws_01", "Draw a smooth curve", false, true, Some(ipc_live))
+            .await
+            .expect("live run_task_with_ipc");
+        assert_eq!(report_live.initial_epoch, Some(3));
+        assert_eq!(report_live.final_epoch, Some(4));
+        assert_eq!(report_live.executed_steps.len(), 1);
+        assert_eq!(report_live.executed_steps[0].status, "ok");
+
+        let live_reqs = srv_live.join().unwrap();
+        let live_methods: Vec<&str> = live_reqs.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(
+            live_methods,
+            vec![
+                "scene.inventory",
+                "capture.frame",
+                "vseat.path",
+                "vseat.cursor_settle"
+            ]
+        );
+        assert_eq!(
+            live_reqs[3].params,
+            json!({ "ws_id": "ws_01", "immediate": false })
+        );
+
+        let (server_dry, client_dry) = std::os::unix::net::UnixStream::pair().unwrap();
+        let srv_dry = spawn_mock_koma_server(server_dry);
+        let ipc_dry = KomaIpcClient::from_test_stream(client_dry);
+
+        let report_dry = engine
+            .run_task_with_ipc("ws_01", "Preview smooth curve", true, true, Some(ipc_dry))
+            .await
+            .expect("dry_run run_task_with_ipc");
+        assert_eq!(report_dry.executed_steps.len(), 1);
+        assert_eq!(report_dry.executed_steps[0].status, "dry_run");
+
+        let dry_reqs = srv_dry.join().unwrap();
+        let dry_methods: Vec<&str> = dry_reqs.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(dry_methods, vec!["scene.inventory", "capture.frame"]);
     }
 }

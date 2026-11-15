@@ -181,6 +181,31 @@ pub struct KomaCapturedFrame {
     pub png_bytes: Vec<u8>,
 }
 
+/// Waypoint anchor along a smooth `vseat.path` cursor trajectory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum KomaPathWaypoint {
+    /// Explicit window-local logical coordinate `(x, y)`.
+    Xy {
+        /// Horizontal logical pixel coordinate.
+        x: f64,
+        /// Vertical logical pixel coordinate.
+        y: f64,
+    },
+    /// 15x15 `grid_225` cell label (e.g. `"H8"`).
+    Grid225(String),
+}
+
+impl KomaPathWaypoint {
+    /// Serializes this waypoint into the Koma `vseat.path` wire object shape.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        match self {
+            Self::Xy { x, y } => json!({ "x": x, "y": y }),
+            Self::Grid225(cell) => json!({ "grid_225": cell }),
+        }
+    }
+}
+
 /// Authenticated client connection to Koma's `koma-agent.sock`.
 pub struct KomaIpcClient {
     stream: UnixStream,
@@ -648,6 +673,113 @@ impl KomaIpcClient {
             .and_then(Value::as_u64)
             .unwrap_or(expected_epoch))
     }
+
+    /// Moves the virtual pointer (hover without button press) along a smooth multi-waypoint spline via `vseat.path`.
+    pub fn move_path(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        waypoints: &[KomaPathWaypoint],
+        spline: &str,
+        profile: &str,
+        duration_ms: u64,
+    ) -> Result<u64, KomaIpcError> {
+        self.send_path(
+            ws_id,
+            expected_epoch,
+            waypoints,
+            None,
+            spline,
+            profile,
+            duration_ms,
+        )
+    }
+
+    /// Drags the virtual pointer along a smooth multi-waypoint spline via `vseat.path`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drag_path(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        waypoints: &[KomaPathWaypoint],
+        button: &str,
+        spline: &str,
+        profile: &str,
+        duration_ms: u64,
+    ) -> Result<u64, KomaIpcError> {
+        self.send_path(
+            ws_id,
+            expected_epoch,
+            waypoints,
+            Some(button),
+            spline,
+            profile,
+            duration_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_path(
+        &mut self,
+        ws_id: &str,
+        expected_epoch: u64,
+        waypoints: &[KomaPathWaypoint],
+        button: Option<&str>,
+        spline: &str,
+        profile: &str,
+        duration_ms: u64,
+    ) -> Result<u64, KomaIpcError> {
+        let waypoint_values: Vec<Value> = waypoints
+            .iter()
+            .map(KomaPathWaypoint::to_json_value)
+            .collect();
+        let (hold_start_ms, hold_end_ms) = if button.is_some() { (20, 20) } else { (0, 0) };
+        let res = self.call_rpc(
+            "vseat.path",
+            json!({
+                "ws_id": ws_id,
+                "expected_epoch": expected_epoch,
+                "auto_acquire": true,
+                "waypoints": waypoint_values,
+                "spline": spline,
+                "button": button,
+                "hold_start_ms": hold_start_ms,
+                "hold_end_ms": hold_end_ms,
+                "kinematics": {
+                    "profile": profile,
+                    "duration_ms": duration_ms,
+                },
+            }),
+        )?;
+        Ok(res
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .unwrap_or(expected_epoch))
+    }
+
+    /// Settles (or immediately releases) the virtual agent cursor on `ws_id` via `vseat.cursor_settle`.
+    pub fn settle_cursor(&mut self, ws_id: &str, immediate: bool) -> Result<(), KomaIpcError> {
+        self.call_rpc(
+            "vseat.cursor_settle",
+            json!({
+                "ws_id": ws_id,
+                "immediate": immediate,
+            }),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_stream(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            next_id: 1,
+            instance_dir: PathBuf::new(),
+            session_id: "sess_test".to_string(),
+            read_buf: Vec::new(),
+            pending_fds: VecDeque::new(),
+        }
+    }
 }
 
 /// Discovers the running Koma instance socket directory under `$XDG_RUNTIME_DIR/koma/`
@@ -969,6 +1101,53 @@ pub fn sniff_png_dimensions(png_bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
+pub(crate) fn read_test_rpc_request(
+    stream: &UnixStream,
+    buf: &mut Vec<u8>,
+) -> io::Result<KomaRpcRequest> {
+    let mut pending_fds = VecDeque::new();
+    let body = read_next_raw_frame(stream, buf, &mut pending_fds)?;
+    serde_json::from_slice(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_rpc_response(
+    stream: &UnixStream,
+    resp: &KomaRpcResponse,
+    fds: Vec<OwnedFd>,
+) -> io::Result<()> {
+    let body = serde_json::to_vec(resp)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    send_frame_with_fds(stream, &body, fds)
+}
+
+#[cfg(test)]
+pub(crate) fn create_sealed_test_rgba_memfd(width: u32, height: u32) -> (OwnedFd, usize) {
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+    use std::io::Write as _;
+
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            rgba.extend_from_slice(&[((x * 60) % 256) as u8, ((y * 60) % 256) as u8, 128, 255]);
+        }
+    }
+    let cname = std::ffi::CString::new("jiku_test_memfd").unwrap();
+    let fd = memfd_create(&cname, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).unwrap();
+    let mut file = File::from(fd);
+    file.write_all(&rgba).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let memfd = OwnedFd::from(file);
+    fcntl_add_seals(
+        &memfd,
+        SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE | SealFlags::SEAL,
+    )
+    .unwrap();
+    (memfd, rgba.len())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
@@ -1169,5 +1348,121 @@ mod tests {
         assert_eq!(r1, 2);
         assert_eq!(r2, 3);
         srv_handle.join().unwrap();
+    }
+
+    #[test]
+    fn move_path_drag_path_and_settle_cursor_send_expected_wire_payloads() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let mut ipc = KomaIpcClient::from_test_stream(client);
+
+        let srv_handle = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut buf = Vec::new();
+            let replies = [
+                json!({ "ok": true, "epoch": 4, "waypoints": 3 }),
+                json!({ "ok": true, "epoch": 5, "waypoints": 2 }),
+                json!({ "ok": true }),
+                json!({ "ok": true }),
+            ];
+            for result in replies {
+                let req = read_test_rpc_request(&server, &mut buf).unwrap();
+                captured.push(req.clone());
+                let resp = KomaRpcResponse {
+                    id: req.id,
+                    result: Some(result),
+                    error: None,
+                };
+                write_test_rpc_response(&server, &resp, Vec::new()).unwrap();
+            }
+            captured
+        });
+
+        let move_waypoints = vec![
+            KomaPathWaypoint::Xy { x: 120.0, y: 240.0 },
+            KomaPathWaypoint::Grid225("H8".to_string()),
+            KomaPathWaypoint::Xy { x: 360.0, y: 240.0 },
+        ];
+        let epoch_after_move = ipc
+            .move_path("ws_01", 3, &move_waypoints, "catmull_rom", "spring", 260)
+            .unwrap();
+        assert_eq!(epoch_after_move, 4);
+
+        let drag_waypoints = vec![
+            KomaPathWaypoint::Grid225("C4".to_string()),
+            KomaPathWaypoint::Grid225("M9".to_string()),
+        ];
+        let epoch_after_drag = ipc
+            .drag_path(
+                "ws_01",
+                epoch_after_move,
+                &drag_waypoints,
+                "left",
+                "bezier",
+                "minimum_jerk",
+                320,
+            )
+            .unwrap();
+        assert_eq!(epoch_after_drag, 5);
+
+        ipc.settle_cursor("ws_01", false).unwrap();
+        ipc.settle_cursor("ws_01", true).unwrap();
+
+        let reqs = srv_handle.join().unwrap();
+        assert_eq!(reqs[0].method, "vseat.path");
+        assert_eq!(
+            reqs[0].params,
+            json!({
+                "ws_id": "ws_01",
+                "expected_epoch": 3,
+                "auto_acquire": true,
+                "waypoints": [
+                    { "x": 120.0, "y": 240.0 },
+                    { "grid_225": "H8" },
+                    { "x": 360.0, "y": 240.0 }
+                ],
+                "spline": "catmull_rom",
+                "button": null,
+                "hold_start_ms": 0,
+                "hold_end_ms": 0,
+                "kinematics": {
+                    "profile": "spring",
+                    "duration_ms": 260
+                }
+            })
+        );
+
+        assert_eq!(reqs[1].method, "vseat.path");
+        assert_eq!(
+            reqs[1].params,
+            json!({
+                "ws_id": "ws_01",
+                "expected_epoch": 4,
+                "auto_acquire": true,
+                "waypoints": [
+                    { "grid_225": "C4" },
+                    { "grid_225": "M9" }
+                ],
+                "spline": "bezier",
+                "button": "left",
+                "hold_start_ms": 20,
+                "hold_end_ms": 20,
+                "kinematics": {
+                    "profile": "minimum_jerk",
+                    "duration_ms": 320
+                }
+            })
+        );
+
+        assert_eq!(reqs[2].method, "vseat.cursor_settle");
+        assert_eq!(
+            reqs[2].params,
+            json!({ "ws_id": "ws_01", "immediate": false })
+        );
+
+        assert_eq!(reqs[3].method, "vseat.cursor_settle");
+        assert_eq!(
+            reqs[3].params,
+            json!({ "ws_id": "ws_01", "immediate": true })
+        );
     }
 }
