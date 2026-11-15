@@ -624,20 +624,15 @@ pub fn parse_bench_step_output(raw_text: &str) -> Result<BenchStepOutput> {
 
 fn extract_json_object_or_array(s: &str) -> Option<&str> {
     let trimmed = s.trim();
-    if let (Some(obj_start), Some(obj_end)) = (trimmed.find('{'), trimmed.rfind('}'))
-        && obj_start < obj_end
+    let obj_start = trimmed.find('{');
+    let arr_start = trimmed.find('[');
+    if obj_start.is_some_and(|o| arr_start.is_none_or(|a| o <= a))
+        && let Some(slice) =
+            crate::drivers::decisions::extract_balanced_json_slice(trimmed, b'{', b'}')
     {
-        let arr_start = trimmed.find('[');
-        if arr_start.is_none_or(|a| obj_start <= a) {
-            return Some(&trimmed[obj_start..=obj_end]);
-        }
+        return Some(slice);
     }
-    if let (Some(arr_start), Some(arr_end)) = (trimmed.find('['), trimmed.rfind(']'))
-        && arr_start < arr_end
-    {
-        return Some(&trimmed[arr_start..=arr_end]);
-    }
-    None
+    crate::drivers::decisions::extract_balanced_json_slice(trimmed, b'[', b']')
 }
 
 #[cfg(test)]

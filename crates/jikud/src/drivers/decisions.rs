@@ -459,7 +459,7 @@ pub(crate) fn parse_emulated_decision_answers(
     questions: &[(String, DecisionQuestionKind)],
 ) -> Result<BTreeMap<String, DecisionAnswer>, DriverError> {
     let stripped = strip_markdown_json_fences(raw_text);
-    let candidate = extract_json_object_slice(stripped).unwrap_or(stripped);
+    let candidate = extract_balanced_json_slice(stripped, b'{', b'}').unwrap_or(stripped);
     let parsed: Value = serde_json::from_str(candidate).map_err(|err| {
         DriverError::InvalidPayload(format!(
             "emulated decision response was not valid JSON ({err}): {raw_text}"
@@ -530,15 +530,41 @@ pub(crate) fn parse_emulated_decision_answers(
     Ok(answers)
 }
 
-fn extract_json_object_slice(s: &str) -> Option<&str> {
+/// Extracts the first balanced JSON container slice delimited by ASCII `open`/`close` bytes,
+/// ignoring stray trailing braces emitted by small VLMs.
+pub(crate) fn extract_balanced_json_slice(s: &str, open: u8, close: u8) -> Option<&str> {
     let trimmed = s.trim();
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if start < end {
-        Some(&trimmed[start..=end])
-    } else {
-        None
+    let start = trimmed.bytes().position(|b| b == open)?;
+    let bytes = trimmed.as_bytes();
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &b) in bytes[start..].iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            _ if b == open => depth += 1,
+            _ if b == close => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&trimmed[start..=start + offset]);
+                }
+            }
+            _ => {}
+        }
     }
+    None
 }
 
 fn default_neutral_answer(expected: &DecisionQuestionKind) -> DecisionAnswer {
@@ -892,7 +918,12 @@ mod tests {
             Some((MANDATORY_CHOICE_FALLBACK, 0.5))
         );
 
-        // 3. Unrelated JSON object is rejected cleanly.
+        // 3. Extra trailing closing brace (observed from small 2B VLMs) still parses cleanly.
+        let trailing_brace = r#"{"answers":{"q_in_scope":{"type":"noul","noul":0.99,"confidence":0.99},"q_strategy":"draw_rainbow_arch"}}}"#;
+        let tb_parsed = parse_emulated_decision_answers(trailing_brace, &questions).unwrap();
+        assert_eq!(tb_parsed["q_in_scope"].noul_prob(), Some(0.99));
+
+        // 4. Unrelated JSON object is rejected cleanly.
         let err = parse_emulated_decision_answers(r#"{"hello":"world"}"#, &questions).unwrap_err();
         assert!(err.to_string().contains("missing `answers` container"));
     }
