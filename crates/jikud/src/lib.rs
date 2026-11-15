@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Desktop orchestration daemon (`jikud`), pure-data model driver contracts,
 //! Koma IPC integration, Phodopus Lua policy hooks, and JikuBox triage.
 //!

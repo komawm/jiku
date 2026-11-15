@@ -1,14 +1,14 @@
 //! Native Unix domain socket IPC client for Koma (`koma-admin.sock` & `koma-agent.sock`).
 //!
 //! Implements 4-byte little-endian JSON framing, `SCM_RIGHTS` sealed `memfd` frame
-//! reception (`mmap PROT_READ`), PNG encoding, perceptual `dHash` computation, and
+//! reception (`File::read_exact`), PNG encoding, perceptual `dHash` computation, and
 //! deterministic `Epoch`-fenced `vseat.*` dispatch.
 
 use std::{
     collections::{BTreeMap, VecDeque},
     env,
     fs::File,
-    io::{self, IoSlice, IoSliceMut, Read as _},
+    io::{self, IoSlice, IoSliceMut, Read as _, Seek as _, SeekFrom},
     mem::MaybeUninit,
     os::{
         fd::{AsFd as _, BorrowedFd, OwnedFd},
@@ -21,7 +21,6 @@ use jiku_memory::compute_rgba_dhash64;
 use rustix::{
     cmsg_space,
     io::Errno,
-    mm::{MapFlags, ProtFlags, mmap, munmap},
     net::{
         RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
         SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
@@ -613,33 +612,11 @@ fn read_memfd_hash_and_encode_png(
         ));
     }
 
-    // SAFETY: Koma exports write-sealed read-only memfds; if mmap is unsupported on a test FD,
-    // we fall back gracefully to reading from File below.
-    let result = unsafe {
-        match mmap(
-            std::ptr::null_mut(),
-            expected,
-            ProtFlags::READ,
-            MapFlags::PRIVATE,
-            &fd,
-            0,
-        ) {
-            Ok(ptr) => {
-                let rgba = std::slice::from_raw_parts(ptr.cast::<u8>(), expected);
-                let encoded = hash_scale_and_encode_png(rgba, width, height, max_edge);
-                let _ = munmap(ptr, expected);
-                encoded
-            }
-            Err(_) => {
-                let mut f = File::from(fd);
-                let mut buf = vec![0_u8; expected];
-                f.read_exact(&mut buf)?;
-                return hash_scale_and_encode_png(&buf, width, height, max_edge);
-            }
-        }
-    }?;
-
-    Ok(result)
+    let mut f = File::from(fd);
+    f.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0_u8; expected];
+    f.read_exact(&mut buf)?;
+    hash_scale_and_encode_png(&buf, width, height, max_edge)
 }
 
 fn hash_scale_and_encode_png(
@@ -828,7 +805,7 @@ pub fn sniff_png_dimensions(png_bytes: &[u8]) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
     use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
-    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::io::Write as _;
 
     #[test]
     fn roundtrip_and_sealed_memfd_png_encode_work_over_unix_pair() {

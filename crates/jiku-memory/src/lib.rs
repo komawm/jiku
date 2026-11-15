@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Pluggable three-tier memory & skill staging store for Jiku.
 //!
 //! - **L0**: Bounded sliding ring of recent workspace frames and 64-bit
