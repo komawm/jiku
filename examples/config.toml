@@ -1,5 +1,9 @@
 # ~/.config/jiku/config.toml — Infrastructure & provider defaults for jikud
 # Mounted Read-Only (ro) inside jikud's Bubblewrap / systemd ProtectHome=tmpfs sandbox.
+#
+# Template values: replace every `<...-model-id>` and `JIKU_*_API_KEY` name with
+# your own provider bindings. `api_key_env` names the environment variable that
+# holds each key; never inline raw secrets here.
 
 [daemon]
 locale = "zh-CN"
@@ -18,28 +22,28 @@ allowed_app_profiles = ["chromium-research", "libreoffice-headless", "gimp-batch
 [providers.gemini]
 kind = "google_gemini"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
-api_key_env = "GEMINI_API_KEY"
+api_key_env = "JIKU_DECISION_API_KEY"
 
 [providers.opencode_go]
 kind = "opencode_go"
 base_url = "https://opencode.ai/inference/go/openai/v1"
-api_key_env = "OPENCODE_GO_API_KEY"
+api_key_env = "JIKU_PLANNER_API_KEY"
 thinking = false
 
 [providers.openai]
 kind = "openai_compatible"
 base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+api_key_env = "JIKU_OPENAI_API_KEY"
 
 [providers.anthropic]
 kind = "anthropic"
 base_url = "https://api.anthropic.com/v1"
-api_key_env = "ANTHROPIC_API_KEY"
+api_key_env = "JIKU_ANTHROPIC_API_KEY"
 
 [providers.openrouter]
 kind = "openai_compatible"
 base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
+api_key_env = "JIKU_OPENROUTER_API_KEY"
 
 [providers.local_vlm]
 kind = "openai_compatible"
@@ -51,25 +55,25 @@ thinking = false
 
 [roles.planner]
 provider = "opencode_go"
-model = "deepseek-v4.1-flash"
+model = "<primary-text-model-id>"
 driver = "turn_sse"
 thinking = false
 temperature = 0.2
 
 [roles.actor]
 provider = "gemini"
-model = "gemini-decision-1"
+model = "<decision-model-id>"
 driver = "decisions"
 coordinate_mode = "grid_225_or_normalized_1000"
 temperature = 0.0
 
-# Optional dedicated decision model (`gemini-decision-1`).
-# If `GEMINI_API_KEY` or `gemini-decision-1` is omitted or unavailable, `jikud`
-# falls back to `[roles.planner]` (`deepseek-v4.1-flash`, thinking disabled)
-# via structured JSON emulation without error.
+# Optional dedicated decision model (provider's native decision model ID).
+# If the decision role's provider key or model is omitted or unavailable, `jikud`
+# falls back to `[roles.planner]` (thinking disabled) via structured JSON
+# emulation without error.
 [roles.decision_router]
 provider = "gemini"
-model = "gemini-decision-1"
+model = "<decision-model-id>"
 driver = "decisions"
 optional = true
 fallback_to_primary_text_model = true
@@ -82,9 +86,9 @@ require_scope_gate = true
 
 [decision_router]
 decision_provider = "gemini"
-decision_model_id = "gemini-decision-1"
+decision_model_id = "<decision-model-id>"
 primary_provider = "opencode_go"
-primary_text_model_id = "deepseek-v4.1-flash"
+primary_text_model_id = "<primary-text-model-id>"
 fast_path_confidence_threshold = 0.85
 max_questions_per_batch = 8
 
@@ -107,7 +111,7 @@ rows = 15
 # Disabled until `jiku live` is invoked explicitly.
 
 [live_session]
-model = "gemini-2.5-flash-live"
+model = "<live-model-id>"
 response_modality = "Audio"
 output_audio_transcription = true
 proactive_audio = false
@@ -122,7 +126,7 @@ require_koma_epoch_fence = true
 
 [roles.live_companion]
 provider = "gemini"
-model = "gemini-2.5-flash-live"
+model = "<live-model-id>"
 driver = "live_websocket"
 optional = true
 response_modality = "AUDIO"
@@ -139,7 +143,7 @@ default_tool_scheduling = "WHEN_IDLE"
 
 [roles.fast_guard]
 provider = "local_vlm"
-model = "qwen2.5-vl-3b-instruct"
+model = "<local-vlm-model-id>"
 driver = "turn_sse"
 thinking = false
 optional = true
@@ -148,7 +152,7 @@ optional = true
 
 [jikubox.triage]
 driver = "decisions"
-model = "gemini-decision-1"
+model = "<decision-model-id>"
 max_questions_per_batch = 1000
 prefer_noul_checklists = true
 

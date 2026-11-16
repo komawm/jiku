@@ -6,19 +6,19 @@ Canonical ecosystem documentation lives in [komawm/docs](https://github.com/koma
 
 ## Workspace Crates
 
-| Crate | Purpose |
-| --- | --- |
-| [`crates/jikud`](crates/jikud) | Daemon (`jikud`), TOML config, Three-Driver clients (`DecisionsDriver`, `TurnModelDriver`, `LiveSessionDriver`), `KomaIpcClient` (`SCM_RIGHTS` sealed `memfd` + `Epoch` fencing), embedded [Phodopus](https://github.com/Xuepoo/phodopus) Lua 5.4 sandbox, and `~/JikuBox` classifier |
-| [`crates/jiku`](crates/jiku) | Controller binary (`jiku`), `jiku.sock` RPC / in-process fallback client, and JSON-RPC 2.0 stdio MCP server (`jiku mcp`) |
-| [`crates/jiku-memory`](crates/jiku-memory) | L0 perceptual `dHash` frame ring, L1 per-`app_id` quirk notes, L2 SQLite WAL + FTS5 BM25 episode index, and sanitized `staged_skills` diff/approval store |
-| [`crates/jiku-tts`](crates/jiku-tts) | D-Bus/`notify-send` alerts (`DesktopNotifier`), `NoopTtsProvider`, VOICEVOX mora-viseme extractor, OpenAI-compatible `/audio/speech`, and 24 kHz PCM `AvatarCue` envelope extraction |
+| Crate                                      | Purpose                                                                                                                                                                                                                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`crates/jikud`](crates/jikud)             | Daemon (`jikud`), TOML config, Three-Driver clients (`DecisionsDriver`, `TurnModelDriver`, `LiveSessionDriver`), `KomaIpcClient` (`SCM_RIGHTS` sealed `memfd` + `Epoch` fencing), embedded [Phodopus](https://github.com/Xuepoo/phodopus) Lua 5.4 sandbox, and `~/JikuBox` classifier |
+| [`crates/jiku`](crates/jiku)               | Controller binary (`jiku`), `jiku.sock` RPC / in-process fallback client, and JSON-RPC 2.0 stdio MCP server (`jiku mcp`)                                                                                                                                                              |
+| [`crates/jiku-memory`](crates/jiku-memory) | L0 perceptual `dHash` frame ring, L1 per-`app_id` quirk notes, L2 SQLite WAL + FTS5 BM25 episode index, and sanitized `staged_skills` diff/approval store                                                                                                                             |
+| [`crates/jiku-tts`](crates/jiku-tts)       | D-Bus/`notify-send` alerts (`DesktopNotifier`), `NoopTtsProvider`, VOICEVOX mora-viseme extractor, OpenAI-compatible `/audio/speech`, and 24 kHz PCM `AvatarCue` envelope extraction                                                                                                  |
 
-## Default Model Configuration
+## Model Configuration
 
-See [`examples/config.toml`](examples/config.toml) and [`examples/init.lua`](examples/init.lua):
+See [`examples/config.toml`](examples/config.toml) and [`examples/init.lua`](examples/init.lua). Both are generic templates: provider endpoints, model IDs, and the `api_key_env` variable names are placeholders you replace with your own bindings. No vendor or model is hard-coded.
 
-- **Decision Router & JikuBox Triage**: Google Gemini `gemini-decision-1` (`$GEMINI_API_KEY` -> `POST /v1beta/decisions`) with zero output tokens, falling back seamlessly to `EmulatedStructuredTextModel` on the primary planner when `GEMINI_API_KEY` is unset or `--emulate` is requested.
-- **Planner (`[roles.planner]`)**: [OpenCode Go](https://opencode.ai) gateway (`$OPENCODE_GO_API_KEY` -> `https://opencode.ai/inference/go/openai/v1/chat/completions`) targeting **`deepseek-v4.1-flash`** with `thinking = false` (`"thinking": {"type": "disabled"}`) and deterministic `x-opencode-session` UUID headers.
+- **Decision Router & JikuBox Triage**: an optional dedicated decision model reached through a native decisions endpoint (`POST /v1beta/decisions`) with zero output tokens, falling back seamlessly to `EmulatedStructuredTextModel` on the primary planner when the role is unset or `--emulate` is requested.
+- **Planner (`[roles.planner]`)**: any text/VLM provider you configure (OpenAI-compatible, Anthropic, Google AI Studio, or a local `vLLM` / `llama.cpp` / `Ollama` endpoint), with optional `thinking = false` (`"thinking": {"type": "disabled"}`), deterministic session headers, and the API key read from the variable named by `api_key_env`.
 
 ## Quick Start
 

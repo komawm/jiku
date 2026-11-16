@@ -847,28 +847,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_repository_example_config_with_opencode_go_and_gemini() {
+    fn parses_repository_example_config() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let example_path = manifest_dir.join("../../examples/config.toml");
         let cfg =
             JikuConfig::load_from_path(&example_path).expect("example config.toml must validate");
 
-        let opencode = cfg
-            .providers
-            .get("opencode_go")
-            .expect("opencode_go provider");
-        assert_eq!(opencode.kind, ProviderKind::OpenCodeGo);
-        assert_eq!(opencode.api_key_env, "OPENCODE_GO_API_KEY");
-        assert_eq!(opencode.thinking, Some(false));
-
         let planner = cfg.roles.get("planner").expect("planner role");
         assert_eq!(planner.provider, "opencode_go");
-        assert_eq!(planner.model, "deepseek-v4.1-flash");
-        assert!(!cfg.resolve_thinking_enabled(Some(planner), opencode));
+        let planner_provider = cfg
+            .providers
+            .get(&planner.provider)
+            .expect("planner provider");
+        assert_eq!(planner_provider.kind, ProviderKind::OpenCodeGo);
+        assert_eq!(planner_provider.api_key_env, "JIKU_PLANNER_API_KEY");
+        assert!(!cfg.resolve_thinking_enabled(Some(planner), planner_provider));
 
-        let gemini = cfg.providers.get("gemini").expect("gemini provider");
-        assert_eq!(gemini.kind, ProviderKind::GoogleGemini);
-        assert_eq!(gemini.api_key_env, "GEMINI_API_KEY");
+        let decision = cfg
+            .roles
+            .get("decision_router")
+            .expect("decision_router role");
+        let decision_provider = cfg
+            .providers
+            .get(&decision.provider)
+            .expect("decision provider");
+        assert_eq!(decision_provider.kind, ProviderKind::GoogleGemini);
+        assert_eq!(decision_provider.api_key_env, "JIKU_DECISION_API_KEY");
         assert!(!cfg.tts.enabled);
     }
 
