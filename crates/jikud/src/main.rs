@@ -235,7 +235,16 @@ async fn main() {
         };
         match &args.out {
             Some(out) => match jikud::migrate::migrate_to_path(&cfg, out, args.force) {
-                Ok(path) => println!("wrote {}", path.display()),
+                Ok(path) => {
+                    println!("wrote {}", path.display());
+                    if let Some(toml) = jikud::migrate::shadowed_toml(&path) {
+                        eprintln!(
+                            "note: {} is still loaded first and fully overlaid by {}; remove or rename it to avoid editing dead configuration",
+                            toml.display(),
+                            path.display()
+                        );
+                    }
+                }
                 Err(e) => {
                     eprintln!("migration error: {e}");
                     process::exit(1);
