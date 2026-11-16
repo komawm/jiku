@@ -32,6 +32,7 @@ cargo build --workspace --release --locked
 ./target/release/jikud --headless-check
 ./target/release/jikud --validate-config --config examples/config.toml --policy examples/init.lua
 ./target/release/jikud --validate-config --config examples/config.lua --policy examples/init.lua
+./target/release/jikud --migrate-config --config examples/config.toml --out /tmp/config.lua
 
 # Run daemon ($XDG_RUNTIME_DIR/jiku.sock) or invoke CLI directly
 ./target/release/jikud --daemon --config examples/config.toml --policy examples/init.lua

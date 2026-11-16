@@ -25,6 +25,9 @@ struct CliArgs {
     config: Option<PathBuf>,
     policy: Option<PathBuf>,
     socket: Option<PathBuf>,
+    migrate_config: bool,
+    out: Option<PathBuf>,
+    force: bool,
 }
 
 fn print_usage() {
@@ -38,6 +41,9 @@ OPTIONS:\n    \
     --config <PATH>         Path to config.toml or config.lua (default: $JIKU_CONFIG or ~/.config/jiku/config.toml)\n    \
     --policy <PATH>         Path to init.lua (default: $JIKU_POLICY or ~/.config/jiku/init.lua)\n    \
     --validate-config       Validate configuration and Lua policy, then exit\n    \
+    --migrate-config        Emit an equivalent config.lua (stdout, or --out <PATH>)\n    \
+    --out <PATH>            Destination for --migrate-config output\n    \
+    --force                 Allow --migrate-config to overwrite an existing file\n    \
     --headless-check        Run offline engine, Phodopus sandbox, SQLite FTS5, and compiler checks\n    \
     -V, --version           Print version information\n    \
     -h, --help              Print help"
@@ -61,6 +67,15 @@ fn parse_args() -> Result<CliArgs, i32> {
             "--daemon" => out.daemon = true,
             "--validate-config" => out.validate_config = true,
             "--headless-check" => out.headless_check = true,
+            "--migrate-config" => out.migrate_config = true,
+            "--force" => out.force = true,
+            "--out" => {
+                let Some(val) = args.next() else {
+                    eprintln!("error: --out requires a path argument");
+                    return Err(2);
+                };
+                out.out = Some(PathBuf::from(val));
+            }
             "--config" => {
                 let Some(val) = args.next() else {
                     eprintln!("error: --config requires a path argument");
@@ -90,6 +105,9 @@ fn parse_args() -> Result<CliArgs, i32> {
             }
             other if other.starts_with("--socket=") => {
                 out.socket = Some(PathBuf::from(other.trim_start_matches("--socket=")));
+            }
+            other if other.starts_with("--out=") => {
+                out.out = Some(PathBuf::from(other.trim_start_matches("--out=")));
             }
             unknown => {
                 eprintln!("error: unknown argument `{unknown}`\n");
@@ -205,6 +223,33 @@ async fn main() {
                 process::exit(1);
             }
         }
+    }
+
+    if args.migrate_config {
+        let (cfg, _) = match JikuConfig::load_resolved(args.config.as_deref()) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                eprintln!("configuration error: {e}");
+                process::exit(1);
+            }
+        };
+        match &args.out {
+            Some(out) => match jikud::migrate::migrate_to_path(&cfg, out, args.force) {
+                Ok(path) => println!("wrote {}", path.display()),
+                Err(e) => {
+                    eprintln!("migration error: {e}");
+                    process::exit(1);
+                }
+            },
+            None => match jikud::migrate::render_lua_config(&cfg) {
+                Ok(rendered) => print!("{rendered}"),
+                Err(e) => {
+                    eprintln!("migration error: {e}");
+                    process::exit(1);
+                }
+            },
+        }
+        return;
     }
 
     if args.headless_check {
