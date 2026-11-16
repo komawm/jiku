@@ -15,7 +15,9 @@ Canonical ecosystem documentation lives in [komawm/docs](https://github.com/koma
 
 ## Model Configuration
 
-See [`examples/config.toml`](examples/config.toml) and [`examples/init.lua`](examples/init.lua). Both are generic templates: provider endpoints, model IDs, and the `api_key_env` variable names are placeholders you replace with your own bindings. No vendor or model is hard-coded.
+See [`examples/config.toml`](examples/config.toml), [`examples/config.lua`](examples/config.lua), and [`examples/init.lua`](examples/init.lua). All three are generic templates: provider endpoints, model IDs, and the `api_key_env` variable names are placeholders you replace with your own bindings. No vendor or model is hard-coded.
+
+Configuration is accepted as TOML or Lua, selected by file extension (`--config config.toml` or `--config config.lua`). In the default search `config.lua` is merged field by field over `config.toml`, so a Lua overlay only states the keys it changes. The Lua VM shares the `init.lua` sandbox profile (8 MiB heap, deterministic fuel, no `io`/`os`/`dofile`/`loadfile`), so it cannot read the environment: `api_key_env` stays a variable _name_ and secrets never enter the Lua heap.
 
 - **Decision Router & JikuBox Triage**: an optional dedicated decision model reached through a native decisions endpoint (`POST /v1beta/decisions`) with zero output tokens, falling back seamlessly to `EmulatedStructuredTextModel` on the primary planner when the role is unset or `--emulate` is requested.
 - **Planner (`[roles.planner]`)**: any text/VLM provider you configure (OpenAI-compatible, Anthropic, Google AI Studio, or a local `vLLM` / `llama.cpp` / `Ollama` endpoint), with optional `thinking = false` (`"thinking": {"type": "disabled"}`), deterministic session headers, and the API key read from the variable named by `api_key_env`.
@@ -29,6 +31,7 @@ cargo build --workspace --release --locked
 # Offline validation & daemon self-check (no API keys required)
 ./target/release/jikud --headless-check
 ./target/release/jikud --validate-config --config examples/config.toml --policy examples/init.lua
+./target/release/jikud --validate-config --config examples/config.lua --policy examples/init.lua
 
 # Run daemon ($XDG_RUNTIME_DIR/jiku.sock) or invoke CLI directly
 ./target/release/jikud --daemon --config examples/config.toml --policy examples/init.lua

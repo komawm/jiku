@@ -1,4 +1,5 @@
-//! Runtime TOML configuration schema, validation, and environment/secret resolution.
+//! Runtime configuration schema (`config.toml` / `config.lua`), validation, and
+//! environment/secret resolution.
 
 use std::{
     collections::BTreeMap,
@@ -18,6 +19,13 @@ use crate::{
     MANDATORY_CHOICE_FALLBACK, UPLINK_AUDIO_SAMPLE_RATE_HZ, resolve_decision_execution_mode,
 };
 
+/// Returns `true` when `path` selects the sandboxed Lua configuration front end.
+fn is_lua_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
+}
+
 /// Errors produced when loading or validating [`JikuConfig`].
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -34,6 +42,10 @@ pub enum ConfigError {
     #[error("failed parsing config TOML: {0}")]
     Parse(#[from] toml::de::Error),
 
+    /// Failed evaluating or deserializing a Lua (`config.lua`) configuration.
+    #[error("invalid Lua configuration: {0}")]
+    Lua(String),
+
     /// Semantic validation failed.
     #[error("invalid Jiku configuration: {0}")]
     Invalid(String),
@@ -42,6 +54,7 @@ pub enum ConfigError {
 /// Complete runtime configuration for `jikud` and `jiku`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct JikuConfig {
     /// Daemon locale, socket filename, dropzone path, and audit log switch.
     pub daemon: DaemonConfig,
@@ -149,9 +162,23 @@ impl Default for JikuConfig {
 }
 
 impl JikuConfig {
-    /// Parses a TOML configuration document from `path`.
+    /// Loads a configuration document from `path`.
+    ///
+    /// Files ending in `.lua` are evaluated as sandboxed Phodopus Lua and merged
+    /// over the built-in defaults; every other extension is parsed as TOML.
     pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_from_path_over(Self::default(), path)
+    }
+
+    /// Loads `path` on top of `base`.
+    ///
+    /// TOML documents replace the baseline (their own defaults apply), while Lua
+    /// documents merge field by field over `base`.
+    fn load_from_path_over(base: Self, path: &Path) -> Result<Self, ConfigError> {
         let resolved = expand_tilde_path(path);
+        if is_lua_path(&resolved) {
+            return crate::lua_config::load_lua_config(base, &resolved);
+        }
         let raw = fs::read_to_string(&resolved).map_err(|source| ConfigError::Read {
             path: resolved,
             source,
@@ -162,13 +189,16 @@ impl JikuConfig {
     }
 
     /// Resolves configuration from explicit `--config`, `$JIKU_CONFIG`,
-    /// `$XDG_CONFIG_HOME/jiku/config.toml` / `~/.config/jiku/config.toml`,
-    /// or returns validated built-in defaults if none of those files exist.
+    /// `$XDG_CONFIG_HOME/jiku/config.toml` (optionally overlaid by `config.lua`)
+    /// / `~/.config/jiku/config.lua`, or returns validated built-in defaults.
+    ///
+    /// Format is selected by file extension. In the default search, `config.lua`
+    /// is merged over `config.toml` when both exist.
     pub fn load_resolved(
         explicit_path: Option<&Path>,
     ) -> Result<(Self, Option<PathBuf>), ConfigError> {
         if let Some(p) = explicit_path {
-            let cfg = Self::load_from_path(p)?;
+            let cfg = Self::load_from_path_over(Self::default(), p)?;
             return Ok((cfg, Some(expand_tilde_path(p))));
         }
 
@@ -178,7 +208,7 @@ impl JikuConfig {
             return Ok((cfg, Some(p)));
         }
 
-        let xdg_candidate = env::var_os("XDG_CONFIG_HOME")
+        let dir = env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| {
@@ -186,12 +216,30 @@ impl JikuConfig {
                     .filter(|v| !v.is_empty())
                     .map(|h| PathBuf::from(h).join(".config"))
             })
-            .map(|dir| dir.join("jiku").join("config.toml"));
+            .map(|dir| dir.join("jiku"));
 
-        if let Some(p) = xdg_candidate
-            && p.is_file()
-        {
-            let cfg = Self::load_from_path(&p)?;
+        let toml_path = dir.as_ref().map(|d| d.join("config.toml"));
+        let lua_path = dir.as_ref().map(|d| d.join("config.lua"));
+
+        let toml_cfg = match toml_path.as_ref().filter(|p| p.is_file()) {
+            Some(p) => Some((Self::load_from_path(p)?, p.clone())),
+            None => None,
+        };
+
+        if let Some(p) = lua_path.as_ref().filter(|p| p.is_file()) {
+            let base = match &toml_cfg {
+                Some((cfg, _)) => cfg.clone(),
+                None => {
+                    let def = Self::default();
+                    def.validate()?;
+                    def
+                }
+            };
+            let cfg = crate::lua_config::load_lua_config(base, p)?;
+            return Ok((cfg, Some(p.clone())));
+        }
+
+        if let Some((cfg, p)) = toml_cfg {
             return Ok((cfg, Some(p)));
         }
 
@@ -431,6 +479,7 @@ pub enum ProviderKind {
 
 /// Declarative upstream provider configuration (`[providers.<id>]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderSpec {
     /// Wire protocol family.
     pub kind: ProviderKind,
@@ -447,6 +496,7 @@ pub struct ProviderSpec {
 /// Role routing entry (`[roles.<role>]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct RoleSpec {
     /// Key under `[providers]`.
     pub provider: String,
@@ -502,6 +552,7 @@ pub struct RoleSpec {
 /// `[daemon]` settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// UI/notification locale (default `"zh-CN"`).
     pub locale: String,
@@ -527,6 +578,7 @@ impl Default for DaemonConfig {
 /// `[koma]` compositor IPC defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct KomaTargetConfig {
     /// Default Koma workspace ID (default `"ws_01"`).
     pub default_workspace: String,
@@ -560,6 +612,7 @@ impl Default for KomaTargetConfig {
 /// `[decision_router]` settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionRouterToml {
     /// Dedicated decision provider key.
     pub decision_provider: Option<String>,
@@ -594,6 +647,7 @@ impl Default for DecisionRouterToml {
 /// `[decision_router.compiler]` settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionCompilerToml {
     /// Fast-path confidence gate.
     pub fast_path_confidence: f32,
@@ -631,6 +685,7 @@ impl Default for DecisionCompilerToml {
 /// `[decision_router.compiler.grid]` dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct GridToml {
     /// Horizontal column count (`1..=26`).
     pub cols: u8,
@@ -647,6 +702,7 @@ impl Default for GridToml {
 /// `[live_session]` settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct LiveSessionToml {
     /// Live model ID.
     pub model: String,
@@ -696,6 +752,7 @@ impl Default for LiveSessionToml {
 /// `[jikubox]` configuration wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct JikuBoxTable {
     /// `[jikubox.triage]` settings.
     pub triage: JikuBoxTriageToml,
@@ -704,6 +761,7 @@ pub struct JikuBoxTable {
 /// `[jikubox.triage]` settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct JikuBoxTriageToml {
     /// Preferred driver (`"decisions"`).
     pub driver: String,
@@ -729,6 +787,7 @@ impl Default for JikuBoxTriageToml {
 /// `[memory]` configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryToml {
     /// Storage backend (`"sqlite_fts5"`).
     pub backend: String,
@@ -757,6 +816,7 @@ impl Default for MemoryToml {
 /// `[notify]` configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct NotifyToml {
     /// Enable desktop D-Bus/`notify-send` alerts.
     pub desktop_dbus: bool,
@@ -784,6 +844,7 @@ impl Default for NotifyToml {
 /// `[tts]` optional speech synthesis configuration (`enabled = false` by default).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct TtsToml {
     /// Master enable switch (false by default).
     pub enabled: bool,
@@ -826,6 +887,7 @@ impl Default for TtsToml {
 /// `[avatar]` companion EventBus cue configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct AvatarToml {
     /// Emit `AvatarCue` JSON packets on daemon status/subscribers.
     pub emit_cues: bool,
@@ -874,6 +936,16 @@ mod tests {
         assert_eq!(decision_provider.kind, ProviderKind::GoogleGemini);
         assert_eq!(decision_provider.api_key_env, "JIKU_DECISION_API_KEY");
         assert!(!cfg.tts.enabled);
+    }
+
+    #[test]
+    fn unknown_toml_keys_are_rejected() {
+        let err = toml::from_str::<JikuConfig>("[daemon]\nnot_a_key = true\n")
+            .expect_err("unknown keys must not deserialize silently");
+        assert!(
+            err.to_string().contains("not_a_key"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

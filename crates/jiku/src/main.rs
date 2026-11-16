@@ -28,7 +28,7 @@ fn print_usage() {
 USAGE:\n    \
     jiku [GLOBAL OPTIONS] <COMMAND> [ARGS]\n\n\
 GLOBAL OPTIONS:\n    \
-    --config <PATH>         Path to config.toml\n    \
+    --config <PATH>         Path to config.toml or config.lua\n    \
     --policy <PATH>         Path to init.lua\n    \
     --socket <PATH>         Override jikud Unix socket path\n    \
     --json                  Emit machine-readable JSON output\n    \

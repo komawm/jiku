@@ -35,7 +35,7 @@ USAGE:\n    \
 OPTIONS:\n    \
     --daemon                Run persistent $XDG_RUNTIME_DIR/jiku.sock RPC daemon (default)\n    \
     --socket <PATH>         Override Unix domain socket path\n    \
-    --config <PATH>         Path to config.toml (default: $JIKU_CONFIG or ~/.config/jiku/config.toml)\n    \
+    --config <PATH>         Path to config.toml or config.lua (default: $JIKU_CONFIG or ~/.config/jiku/config.toml)\n    \
     --policy <PATH>         Path to init.lua (default: $JIKU_POLICY or ~/.config/jiku/init.lua)\n    \
     --validate-config       Validate configuration and Lua policy, then exit\n    \
     --headless-check        Run offline engine, Phodopus sandbox, SQLite FTS5, and compiler checks\n    \
