@@ -54,16 +54,21 @@ jiku a11y act type      @s3:e17 "dark mode"
 jiku a11y act read-value @s3:e17
 ```
 
-| Verb         | Effect                                                                                 |
-| ------------ | -------------------------------------------------------------------------------------- |
-| `click`      | Invokes the element's default action (`click`, `press`, or `activate`).                |
-| `focus`      | Moves accessibility/input focus.                                                       |
-| `set-value`  | Sets the value directly, without synthesizing keystrokes. Prefer this for text fields. |
-| `type`       | Types through the input path when the toolkit ignores `set-value`.                     |
-| `read-value` | Reads the current value back, useful for verification.                                 |
+| Verb         | Effect                                                                                                |
+| ------------ | ----------------------------------------------------------------------------------------------------- |
+| `click`      | Invokes the element's default action (`click`, `press`, or `activate`).                               |
+| `focus`      | Moves accessibility/input focus.                                                                      |
+| `set-value`  | Sets the value through `EditableText.SetTextContents`. Prefer this for text fields.                   |
+| `type`       | Currently the same `SetTextContents` call as `set-value`; the verb exists for hosts that expose both. |
+| `read-value` | Reads the current value back, useful for verification.                                                |
 
 MCP equivalent: `jiku_a11y_act` with `action` and `target_ref`, plus `text` for
 `set-value`/`type`.
+
+If a widget rejects `SetTextContents` (some Electron and Java apps), no AT-SPI
+verb will get text in. Switch to `koma_inject_text` on the focused window, which
+uses the compositor's Zero-IME input path and is a genuinely different mechanism
+rather than a different verb.
 
 The compositor only advertises verbs the element actually implements. If a verb
 is missing from the snapshot's `[actions]` list, it will fail — do not retry it
@@ -73,7 +78,7 @@ with a different spelling.
 
 1. `set-value` if the element lists it. Deterministic, no focus dependency.
 2. `click` if the element is a button/toggle.
-3. `type` only for widgets that reject `set-value` (some Electron apps).
+3. `koma_inject_text` when the widget rejects `SetTextContents` entirely.
 4. Fall back to `koma_click` on a `grid_225` cell when no accessible tree exists.
 
 ## Verification
