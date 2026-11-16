@@ -3,13 +3,16 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# Quality gates: metadata, actionlint, shellcheck, format, typecheck, clippy, and tests.
-check: infra-check fmt-check typecheck clippy test
+# Quality gates: metadata, skills, actionlint, shellcheck, format, typecheck, clippy, and tests.
+check: infra-check skills-check fmt-check typecheck clippy test
 
 infra-check: metadata actionlint scripts-check
 
 metadata:
     python3 scripts/check-infrastructure.py
+
+skills-check:
+    python3 scripts/check-skills.py
 
 cargo-metadata:
     cargo metadata --format-version 1 --no-deps > /dev/null

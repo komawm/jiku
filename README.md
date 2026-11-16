@@ -22,6 +22,16 @@ Configuration is accepted as TOML or Lua, selected by file extension (`--config 
 - **Decision Router & JikuBox Triage**: an optional dedicated decision model reached through a native decisions endpoint (`POST /v1beta/decisions`) with zero output tokens, falling back seamlessly to `EmulatedStructuredTextModel` on the primary planner when the role is unset or `--emulate` is requested.
 - **Planner (`[roles.planner]`)**: any text/VLM provider you configure (OpenAI-compatible, Anthropic, Google AI Studio, or a local `vLLM` / `llama.cpp` / `Ollama` endpoint), with optional `thinking = false` (`"thinking": {"type": "disabled"}`), deterministic session headers, and the API key read from the variable named by `api_key_env`.
 
+## Agent Skill
+
+The bundled agent skill installs through the [Skills CLI](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add komawm/jiku --skill jiku-desktop-orchestration -g
+```
+
+It lives at [`skills/jiku-desktop-orchestration/`](skills/jiku-desktop-orchestration) and is MIT licensed, independent of the repository's GPL-3.0-or-later product license. See [`skills/README.md`](skills/README.md).
+
 ## Quick Start
 
 ```bash
@@ -54,4 +64,4 @@ The following items remain deferred to `v0.1.0` and are not yet active runtime f
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE). The bundled agent skill under [`skills/`](skills) is MIT licensed; its own `LICENSE` travels with the directory.

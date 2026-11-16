@@ -22,6 +22,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate descriptors
         run: python3 scripts/check-infrastructure.py
+      - name: Validate agent skill catalog
+        run: python3 scripts/check-skills.py
       - name: Lint shell entry points
         run: shellcheck scripts/*.sh
       - name: Lint GitHub workflows
@@ -53,4 +55,3 @@ jobs:
         run: just clippy
       - name: Run available tests
         run: just test
-
