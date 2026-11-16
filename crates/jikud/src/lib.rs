@@ -25,7 +25,9 @@ pub mod drivers;
 pub mod grounding;
 pub mod jikubox;
 pub mod koma_ipc;
+pub mod lua_config;
 pub mod lua_policy;
+pub mod migrate;
 
 use std::collections::HashSet;
 

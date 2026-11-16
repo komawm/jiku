@@ -38,6 +38,7 @@ Safety: never forge secrets; halt on protected surface (4032) or human Mod+G pre
 /// `[context]` budgeting and progressive compaction settings in `JikuConfig`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ContextConfig {
     /// Default model context window in tokens (overridden per role when set).
     pub max_context_tokens: u32,

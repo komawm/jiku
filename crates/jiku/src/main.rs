@@ -28,7 +28,7 @@ fn print_usage() {
 USAGE:\n    \
     jiku [GLOBAL OPTIONS] <COMMAND> [ARGS]\n\n\
 GLOBAL OPTIONS:\n    \
-    --config <PATH>         Path to config.toml\n    \
+    --config <PATH>         Path to config.toml or config.lua\n    \
     --policy <PATH>         Path to init.lua\n    \
     --socket <PATH>         Override jikud Unix socket path\n    \
     --json                  Emit machine-readable JSON output\n    \
@@ -36,7 +36,8 @@ GLOBAL OPTIONS:\n    \
     -h, --help              Print help\n\n\
 COMMANDS:\n    \
     status                  Show daemon, model driver, memory DB, and Koma status\n    \
-    validate-config         Validate config.toml and init.lua offline\n    \
+    validate-config         Validate config.toml/config.lua and init.lua offline\n    \
+    migrate-config          Emit an equivalent config.lua (--out <PATH> [--force])\n    \
     decide                  Evaluate calibrated Noul/Choice questions (gemini-decision-1)\n    \
     plan                    Run a TurnModelDriver call (OpenCode Go deepseek-v4.1-flash)\n    \
     run                     Execute Observe -> Decide -> Plan -> Koma Action task loop\n    \
@@ -231,6 +232,48 @@ async fn dispatch(globals: GlobalOpts, subcmd: &str, tail: &[String]) -> Result<
                     .as_deref()
                     .unwrap_or("emulated")
             );
+        }
+        return Ok(());
+    }
+
+    if subcmd == "migrate-config" {
+        let mut out: Option<PathBuf> = None;
+        let mut force = false;
+        let mut it = tail.iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--force" => force = true,
+                "--out" => {
+                    let Some(val) = it.next() else {
+                        return Err(CmdError::Usage(
+                            "--out requires a path argument".to_string(),
+                        ));
+                    };
+                    out = Some(PathBuf::from(val));
+                }
+                other if other.starts_with("--out=") => {
+                    out = Some(PathBuf::from(other.trim_start_matches("--out=")));
+                }
+                other => {
+                    return Err(CmdError::Usage(format!(
+                        "unknown migrate-config option `{other}`"
+                    )));
+                }
+            }
+        }
+        let (cfg, _) =
+            JikuConfig::load_resolved(globals.config.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+        match out {
+            Some(path) => {
+                let written = jikud::migrate::migrate_to_path(&cfg, &path, force)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                println!("wrote {}", written.display());
+            }
+            None => {
+                let rendered = jikud::migrate::render_checked_lua_config(&cfg)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                print!("{rendered}");
+            }
         }
         return Ok(());
     }
