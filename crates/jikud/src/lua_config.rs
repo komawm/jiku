@@ -37,8 +37,8 @@
 use std::{cell::RefCell, fs, path::Path, rc::Rc};
 
 use phodopus::{
-    Callback, CallbackReturn, Closure, Error as LuaError, Executor, Fuel, Lua, RuntimeError, Table,
-    Value,
+    Callback, CallbackReturn, Closure, Context, Error as LuaError, Executor, Fuel, Lua,
+    RuntimeError, Stack, Table, Value,
 };
 use phodopus_util::serde::{LuaSerdeExt as _, from_value};
 use serde_json::Value as JsonValue;
@@ -50,6 +50,11 @@ pub const CONFIG_LUA_HEAP_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Instruction budget for evaluating `config.lua`.
 pub const CONFIG_LUA_FUEL_BUDGET: i32 = 200_000;
+
+/// Upper bound on the accumulated JSON configuration document (4 MiB). The Lua
+/// heap ceiling does not cover the Rust-side accumulator, so patches are measured
+/// after each call and rejected when the document exceeds this size.
+pub const CONFIG_LUA_JSON_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Loads `config.lua` from `path` and merges it over `base`.
 pub fn load_lua_config(base: JikuConfig, path: &Path) -> Result<JikuConfig, ConfigError> {
@@ -72,31 +77,49 @@ pub fn apply_lua_source(
     source: &str,
     label: &str,
 ) -> Result<JikuConfig, ConfigError> {
-    let patches: Rc<RefCell<Vec<JsonValue>>> = Rc::new(RefCell::new(Vec::new()));
+    let merged = Rc::new(RefCell::new(serde_json::to_value(&base).map_err(|e| {
+        ConfigError::Lua(format!("failed serializing base configuration: {e}"))
+    })?));
 
     let mut builder = Lua::builder();
     builder.memory_limit(CONFIG_LUA_HEAP_LIMIT_BYTES);
     let mut lua = builder.build();
     lua.load_serde();
 
-    let sink = patches.clone();
     lua.try_enter(|ctx| {
         let jiku = Table::new(&ctx);
-        jiku.set_field(
-            ctx,
-            "config",
-            Callback::from_fn(&ctx, move |ctx, _, mut stack| {
-                let value: Value = stack.consume(ctx)?;
-                let patch: JsonValue = from_value(value).map_err(RuntimeError::new)?;
-                if !patch.is_object() {
-                    return Err(LuaError::from(RuntimeError::new(std::io::Error::other(
-                        "jiku.config{...} expects a table of named configuration sections",
-                    ))));
-                }
-                sink.borrow_mut().push(patch);
-                Ok(CallbackReturn::Return)
-            }),
-        );
+        {
+            let acc = merged.clone();
+            jiku.set_field(
+                ctx,
+                "config",
+                Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                    let patch = consume_object(ctx, &mut stack, "jiku.config{...}")?;
+                    {
+                        let mut document = acc.borrow_mut();
+                        deep_merge(&mut document, &patch);
+                        ensure_document_bound(&document)?;
+                    }
+                    Ok(CallbackReturn::Return)
+                }),
+            );
+        }
+        {
+            let acc = merged.clone();
+            jiku.set_field(
+                ctx,
+                "config_replace",
+                Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                    let patch = consume_object(ctx, &mut stack, "jiku.config_replace{...}")?;
+                    {
+                        let mut document = acc.borrow_mut();
+                        replace_sections(&mut document, &patch);
+                        ensure_document_bound(&document)?;
+                    }
+                    Ok(CallbackReturn::Return)
+                }),
+            );
+        }
         ctx.globals().set_field(ctx, "jiku", jiku);
         Ok(())
     })
@@ -123,19 +146,54 @@ pub fn apply_lua_source(
     })
     .map_err(|e| ConfigError::Lua(format!("evaluation error in {label}: {e}")))?;
 
-    let mut merged = serde_json::to_value(&base)
-        .map_err(|e| ConfigError::Lua(format!("failed serializing base configuration: {e}")))?;
-    for patch in patches.borrow().iter() {
-        deep_merge(&mut merged, patch);
-    }
+    let document = merged.borrow().clone();
 
-    let cfg: JikuConfig = serde_json::from_value(merged).map_err(|e| {
+    let cfg: JikuConfig = serde_json::from_value(document).map_err(|e| {
         ConfigError::Lua(format!(
             "schema mismatch in {label} (unknown keys or wrong value types): {e}"
         ))
     })?;
     cfg.validate()?;
     Ok(cfg)
+}
+
+/// Consumes a Lua argument as a JSON object, rejecting scalars and arrays.
+fn consume_object<'gc>(
+    ctx: Context<'gc>,
+    stack: &mut Stack<'gc, '_>,
+    name: &'static str,
+) -> Result<JsonValue, LuaError<'gc>> {
+    let value: Value<'gc> = stack.consume(ctx)?;
+    let patch: JsonValue = from_value(value).map_err(RuntimeError::new)?;
+    if !patch.is_object() {
+        return Err(LuaError::from(RuntimeError::new(std::io::Error::other(
+            format!("{name} expects a table of named configuration sections"),
+        ))));
+    }
+    Ok(patch)
+}
+
+/// Rejects accumulator documents that exceed [`CONFIG_LUA_JSON_LIMIT_BYTES`].
+fn ensure_document_bound<'gc>(document: &JsonValue) -> Result<(), LuaError<'gc>> {
+    let len = serde_json::to_string(document)
+        .map(|text| text.len())
+        .unwrap_or(usize::MAX);
+    if len > CONFIG_LUA_JSON_LIMIT_BYTES {
+        return Err(LuaError::from(RuntimeError::new(std::io::Error::other(
+            "config.lua produced a configuration document larger than 4 MiB",
+        ))));
+    }
+    Ok(())
+}
+
+/// Replaces whole top-level sections with the provided values.
+fn replace_sections(base: &mut JsonValue, patch: &JsonValue) {
+    let (Some(base_map), JsonValue::Object(patch_map)) = (base.as_object_mut(), patch) else {
+        return;
+    };
+    for (key, value) in patch_map {
+        base_map.insert(key.clone(), value.clone());
+    }
 }
 
 /// Recursively merges `patch` into `base`: objects merge key by key, every other

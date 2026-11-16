@@ -270,8 +270,8 @@ async fn dispatch(globals: GlobalOpts, subcmd: &str, tail: &[String]) -> Result<
                 println!("wrote {}", written.display());
             }
             None => {
-                let rendered =
-                    jikud::migrate::render_lua_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+                let rendered = jikud::migrate::render_checked_lua_config(&cfg)
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 print!("{rendered}");
             }
         }

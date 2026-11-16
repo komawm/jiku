@@ -241,7 +241,7 @@ async fn main() {
                     process::exit(1);
                 }
             },
-            None => match jikud::migrate::render_lua_config(&cfg) {
+            None => match jikud::migrate::render_checked_lua_config(&cfg) {
                 Ok(rendered) => print!("{rendered}"),
                 Err(e) => {
                     eprintln!("migration error: {e}");

@@ -68,9 +68,9 @@ coordinate_mode = "grid_225_or_normalized_1000"
 temperature = 0.0
 
 # Optional dedicated decision model (provider's native decision model ID).
-# If the decision role's provider key or model is omitted or unavailable, `jikud`
-# falls back to `[roles.planner]` (thinking disabled) via structured JSON
-# emulation without error.
+# `provider` and `model` are required whenever this section is present. When the
+# provider key is unavailable at runtime, `jikud` falls back to `[roles.planner]`
+# (thinking disabled) via structured JSON emulation without error.
 [roles.decision_router]
 provider = "gemini"
 model = "<decision-model-id>"
