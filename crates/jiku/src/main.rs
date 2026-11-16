@@ -268,6 +268,13 @@ async fn dispatch(globals: GlobalOpts, subcmd: &str, tail: &[String]) -> Result<
                 let written = jikud::migrate::migrate_to_path(&cfg, &path, force)
                     .map_err(|e| anyhow::anyhow!(e))?;
                 println!("wrote {}", written.display());
+                if let Some(toml) = jikud::migrate::shadowed_toml(&written) {
+                    eprintln!(
+                        "note: {} is still loaded first and fully overlaid by {}; remove or rename it to avoid editing dead configuration",
+                        toml.display(),
+                        written.display()
+                    );
+                }
             }
             None => {
                 let rendered = jikud::migrate::render_checked_lua_config(&cfg)
