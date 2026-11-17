@@ -16,14 +16,16 @@ use jiku::{
     client::{JikuClient, JikuClientOptions},
     mcp::{run_mcp_stdio, tool_definitions},
 };
+mod completions;
+
 use jikud::{config::JikuConfig, daemon::RpcDecisionQuestion, lua_policy::JikuLuaPolicy};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn print_usage() {
-    println!(
+fn usage_text() -> String {
+    format!(
         "jiku {VERSION} — Jiku desktop agent CLI & MCP controller\n\n\
 USAGE:\n    \
     jiku [GLOBAL OPTIONS] <COMMAND> [ARGS]\n\n\
@@ -49,8 +51,13 @@ COMMANDS:\n    \
     a11y <snapshot|act>     Inspect normalized AT-SPI tree or execute semantic action\n    \
     context inspect         Inspect context budget and progressive waterfall compaction\n    \
     bench run               Run 2x2 Decision x Grounding VirtualPaint ablation benchmark\n    \
-    mcp                     Run stdio JSON-RPC 2.0 MCP server (--stateless | --print-tools)"
-    );
+    mcp                     Run stdio JSON-RPC 2.0 MCP server (--stateless | --print-tools)\n    \
+    completions <bash|zsh|fish>   Print a shell completion script and exit"
+    )
+}
+
+fn print_usage() {
+    println!("{}", usage_text());
 }
 
 #[derive(Debug, Default)]
@@ -282,6 +289,24 @@ async fn dispatch(globals: GlobalOpts, subcmd: &str, tail: &[String]) -> Result<
                 print!("{rendered}");
             }
         }
+        return Ok(());
+    }
+
+    if subcmd == "completions" {
+        let Some(name) = tail.first() else {
+            eprintln!("usage: jiku completions <bash|zsh|fish>");
+            std::process::exit(2);
+        };
+        let Some(shell) = completions::Shell::parse(name) else {
+            eprintln!(
+                "unknown shell `{name}` (expected {}, {}, or {})",
+                completions::Shell::Bash.name(),
+                completions::Shell::Zsh.name(),
+                completions::Shell::Fish.name()
+            );
+            std::process::exit(2);
+        };
+        print!("{}", completions::render(shell));
         return Ok(());
     }
 
