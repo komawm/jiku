@@ -15,6 +15,42 @@ incubation line before a formal `0.1.0` release.
 - Native Wayland layer-shell companion renderer (`MMD` / `Inochi2D` overlays)
   complementing the browser-hosted `jiku avatar serve` WebSocket VRM stage.
 
+## [0.0.2] - 2026-11-17
+
+### Added
+
+- Sandboxed `config.lua` loader with `config.toml` overlay and format dispatch by
+  file extension. The Lua VM shares the `init.lua` profile (8 MiB heap, 200k
+  fuel, no `io`/`os`/`dofile`/`loadfile`), so `api_key_env` stays a variable
+  name and secrets never enter the Lua heap.
+- `jiku.config{...}` (deep merge over the typed IR) and `jiku.config_replace{...}`
+  (whole-section replacement), plus a 4 MiB JSON accumulator bound.
+- `jikud --migrate-config` and `jiku migrate-config` emit an authoritative
+  `config.lua` that round-trips exactly; the generator refuses silent overwrites
+  and verifies its own output before returning.
+- `migrate::shadowed_toml()` and a stderr notice when a generated `config.lua`
+  sits next to a `config.toml` it fully overlays.
+- Installable agent skill at `skills/jiku-desktop-orchestration/` with an MIT
+  `LICENSE`, a thin router, and references for epochs, MCP setup, AT-SPI
+  targeting, and skill promotion.
+- Shell completions for `jiku` in bash, zsh, and fish via
+  `jiku completions <shell>`, covering nested commands and their flags.
+
+### Changed
+
+- `#[serde(deny_unknown_fields)]` on every configuration container, so a typo
+  fails with a field path instead of silently restoring a default.
+- `--migrate-config` output uses `config_replace`, so generated files are
+  authoritative rather than partial overlays.
+- Documentation of the AT-SPI `type` verb now states that it maps to the same
+  `SetTextContents` call as `set-value`; `koma_inject_text` is the real fallback.
+
+### Fixed
+
+- Reserved Lua keywords are quoted as table keys in generated `config.lua`.
+- `create_new` is used for the migration output path to close a TOCTOU window.
+- Example configuration comments match the shipped schema.
+
 ## [0.0.1] - 2026-11-16
 
 ### Added (trajectories, grounding, small-context compaction, TTS, avatar & MCP)
