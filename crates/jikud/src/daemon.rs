@@ -2,9 +2,9 @@
 //! asynchronous Unix domain socket RPC server.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::Write as _,
-    os::unix::fs::PermissionsExt as _,
+    fs::{self, File, Metadata, OpenOptions},
+    io::{ErrorKind, Write as _},
+    os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,6 +17,11 @@ use jiku_memory::{
 use jiku_tts::{
     AudioPlaybackSink, AudioSinkKind, AvatarCue, AvatarEmotion, DesktopNotifier, EspeakNgProvider,
     IrodoriHttpProvider, NoopTtsProvider, OpenAiSpeechProvider, TtsProvider, VoicevoxProvider,
+};
+use rustix::{
+    fs::{FlockOperation, flock},
+    io::Errno,
+    net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2394,14 +2399,125 @@ fn execute_step_with_epoch_retry(
     Ok(settle_delay)
 }
 
+#[derive(Debug)]
 struct SocketUnlinkGuard {
     path: PathBuf,
+    identity: Metadata,
 }
 
 impl Drop for SocketUnlinkGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // A subsequent startup can recover a stale socket if cleanup cannot acquire the lock.
+        if let Ok(_lock) = lock_socket_directory(&self.path)
+            && socket_matches(&self.path, &self.identity)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+struct SocketDirectoryLock(File);
+
+impl Drop for SocketDirectoryLock {
+    fn drop(&mut self) {
+        // A subprocess forked on another thread can inherit the open file description until exec.
+        let _ = flock(&self.0, FlockOperation::Unlock);
+    }
+}
+
+fn lock_socket_directory(socket_path: &Path) -> anyhow::Result<SocketDirectoryLock> {
+    let parent = socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = File::open(parent)
+        .with_context(|| format!("opening socket directory {}", parent.display()))?;
+    // Serialize bind/recovery and cleanup across jikud instances without a lock file to remove.
+    flock(&directory, FlockOperation::NonBlockingLockExclusive)
+        .with_context(|| format!("locking socket directory {}", parent.display()))?;
+    Ok(SocketDirectoryLock(directory))
+}
+
+fn socket_matches(path: &Path, expected: &Metadata) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|current| {
+        current.file_type().is_socket()
+            && current.dev() == expected.dev()
+            && current.ino() == expected.ino()
+    })
+}
+
+fn bind_daemon_listener(socket_path: &Path) -> anyhow::Result<(UnixListener, SocketUnlinkGuard)> {
+    if let Some(parent) = socket_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let _lock = lock_socket_directory(socket_path)?;
+    match fs::symlink_metadata(socket_path) {
+        Ok(existing) => {
+            if !existing.file_type().is_socket() {
+                bail!(
+                    "refusing to replace non-socket path {}",
+                    socket_path.display()
+                );
+            }
+            let address = SocketAddrUnix::new(socket_path)?;
+            let probe = socket_with(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+                None,
+            )?;
+            match connect(&probe, &address) {
+                Ok(()) | Err(Errno::INPROGRESS | Errno::AGAIN) => bail!(
+                    "another jikud instance is already listening on {}",
+                    socket_path.display()
+                ),
+                Err(Errno::CONNREFUSED) => (),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("probing existing socket {}", socket_path.display())
+                    });
+                }
+            }
+            if !socket_matches(socket_path, &existing) {
+                bail!(
+                    "socket path {} changed during startup",
+                    socket_path.display()
+                );
+            }
+            fs::remove_file(socket_path)
+                .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => (),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", socket_path.display()));
+        }
+    }
+
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("failed binding jikud socket {}", socket_path.display()))?;
+    let identity = fs::symlink_metadata(socket_path)?;
+    if !identity.file_type().is_socket() {
+        bail!(
+            "socket path {} changed during startup",
+            socket_path.display()
+        );
+    }
+    if let Err(error) = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)) {
+        if socket_matches(socket_path, &identity) {
+            let _ = fs::remove_file(socket_path);
+        }
+        return Err(error).with_context(|| format!("setting mode on {}", socket_path.display()));
+    }
+    Ok((
+        listener,
+        SocketUnlinkGuard {
+            path: socket_path.to_path_buf(),
+            identity,
+        },
+    ))
 }
 
 /// Runs the persistent `jikud` Unix socket daemon until `SIGINT`, `SIGTERM`, or `shutdown` RPC.
@@ -2423,28 +2539,7 @@ async fn run_daemon_loop_on_path(
     engine: &mut JikuEngine,
     socket_path: &Path,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = socket_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-
-    if socket_path.exists() {
-        if UnixStream::connect(socket_path).await.is_ok() {
-            bail!(
-                "another jikud instance is already listening on {}",
-                socket_path.display()
-            );
-        }
-        let _ = fs::remove_file(socket_path);
-    }
-
-    let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("failed binding jikud socket {}", socket_path.display()))?;
-    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
-    let _guard = SocketUnlinkGuard {
-        path: socket_path.to_path_buf(),
-    };
+    let (listener, _guard) = bind_daemon_listener(socket_path)?;
 
     tracing::info!(socket = %socket_path.display(), "jikud daemon listening");
 
@@ -2946,6 +3041,7 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -2955,6 +3051,90 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn daemon_socket_path_preserves_non_socket_entries() {
+        let dir = unique_temp_dir("jiku-socket-entries");
+        fs::create_dir(&dir).unwrap();
+        let sentinel = dir.join("existing-file");
+        let symlink_path = dir.join("dangling-symlink");
+        let target = dir.join("missing-target");
+        fs::write(&sentinel, "keep this").unwrap();
+        symlink(&target, &symlink_path).unwrap();
+
+        for path in [&sentinel, &symlink_path, &dir] {
+            let error = bind_daemon_listener(path).expect_err("reject non-socket entry");
+            assert!(error.to_string().contains("refusing to replace non-socket"));
+        }
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep this");
+        assert_eq!(fs::read_link(&symlink_path).unwrap(), target);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_socket_recovery_rejects_a_live_listener() {
+        let dir = unique_temp_dir("jiku-live-socket");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("jiku.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let error = bind_daemon_listener(&path).expect_err("reject live socket");
+        assert!(error.to_string().contains("already listening"));
+        let (_stream, _) = listener.accept().await.unwrap();
+        assert!(path.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_socket_recovery_serializes_overlapping_startups() {
+        let dir = unique_temp_dir("jiku-concurrent-startup");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("jiku.sock");
+        // A bound socket without a listener refuses connections even if a fork inherits its FD.
+        let socket = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        rustix::net::bind(&socket, &SocketAddrUnix::new(&path).unwrap()).unwrap();
+        drop(socket);
+        let stale_socket = fs::symlink_metadata(&path).unwrap();
+
+        let startup_lock = lock_socket_directory(&path).unwrap();
+        // Model a child process holding the same open file description before exec.
+        let inherited_directory = startup_lock.0.try_clone().unwrap();
+        let error = bind_daemon_listener(&path).expect_err("reject concurrent startup");
+        assert!(error.to_string().contains("locking socket directory"));
+        assert!(socket_matches(&path, &stale_socket));
+        drop(startup_lock);
+
+        let (_listener, cleanup) = bind_daemon_listener(&path).expect("retry startup");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(cleanup);
+        assert!(!path.exists());
+        drop(inherited_directory);
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_socket_cleanup_preserves_a_replacement() {
+        let dir = unique_temp_dir("jiku-socket-replacement");
+        let path = dir.join("jiku.sock");
+        let (_listener, cleanup) = bind_daemon_listener(&path).unwrap();
+
+        fs::rename(&path, dir.join("original.sock")).unwrap();
+        let _replacement = UnixListener::bind(&path).unwrap();
+        let identity = fs::symlink_metadata(&path).unwrap();
+        drop(cleanup);
+
+        assert!(socket_matches(&path, &identity));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
